@@ -251,6 +251,44 @@ Migrations are stored in the `migrations/` directory, and run automatically on s
 - `002_listen_notify.sql` - PostgreSQL notify triggers
 - `003_make_hosted_on_not_null.sql` - Schema updates
 
+## Coolify / PaaS Deployment
+
+When deploying via [Coolify](https://coolify.io/) or other PaaS platforms, port
+conflicts can arise if the default host port (3001) is already in use on the
+target server.
+
+### Environment Variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `HOST_PORT` | `3001` | Port exposed on the Docker **host** (the port the outside world connects to). |
+| `CONTAINER_PORT` | `3001` | Port the application listens on **inside** the container. |
+
+Both variables can be set independently. For example, to expose the service on
+host port 8080 while keeping the container on its default port 3001:
+
+```bash
+# Via environment variables
+HOST_PORT=8080 CONTAINER_PORT=3001 docker compose up -d
+
+# Or via a .env file next to docker-compose.yml
+echo "HOST_PORT=8080" >> .env
+docker compose up -d
+```
+
+### Coolify-specific guidance
+
+1. **Port conflict** – If Coolify reports that port 3001 is already occupied,
+   set `HOST_PORT` to an available port (e.g. `HOST_PORT=8080`) in the
+   Coolify environment variable panel for this service.
+2. **Automatic port allocation** – Coolify can manage the external port through
+   its UI. In that case leave `HOST_PORT` unset; Coolify will overwrite the
+   port mapping during deployment.
+3. **Container port** – Only change `CONTAINER_PORT` if you also need the
+   in-container listening port to differ from the default (rare). When changed,
+   `DWCTL_PORT` is automatically set to the same value so the application
+   binds to the correct port.
+
 ## API Endpoints
 
 - See OpenAPI docs at `/admin/docs` when running

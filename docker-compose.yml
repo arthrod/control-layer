@@ -17,17 +17,23 @@ services:
   control-layer:
     image: ${IMAGE:-ghcr.io/doublewordai/control-layer:${TAG:-latest}}
     pull_policy: ${PULL_POLICY:-always}
+    # HOST_PORT: the port exposed on the Docker host (default: 3001).
+    #   Override this when the default host port is already in use, e.g. HOST_PORT=8080.
+    #   For Coolify deployments, set HOST_PORT to any available port or let Coolify
+    #   manage port allocation through its UI.
+    # CONTAINER_PORT: the port the application listens on inside the container (default: 3001).
+    #   Override this only if you need the in-container port to differ from the default.
     ports:
-      - "83836:83836"
-    environments:
-      - RUST_LOG: ${RUST_LOG:-info}
-      - DATABASE_URL: postgres://${POSTGRES_DB}${POSTGRES_DB}@postgres:5432/${POSTGRES_DB}
-      - DWCTL_SECRET_KEY: ${DWCTL_SECRET_KEY}
-
+      - "${HOST_PORT:-3001}:${CONTAINER_PORT:-3001}"
+    environment:
+      RUST_LOG: ${RUST_LOG:-info}
+      DATABASE_URL: postgres://${POSTGRES_USER:-control_layer}:${POSTGRES_PASSWORD:-control_layer_password}@postgres:5432/${POSTGRES_DB:-control_layer}
+      DWCTL_SECRET_KEY: ${DWCTL_SECRET_KEY}
+      DWCTL_PORT: ${CONTAINER_PORT:-3001}
     volumes:
       - ./config.yaml:/app/config.yaml:ro
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:3001/healthz"]
+      test: ["CMD-SHELL", "curl -f http://localhost:${CONTAINER_PORT:-3001}/healthz"]
       start_period: 1s
       interval: 100s
       timeout: 3s
