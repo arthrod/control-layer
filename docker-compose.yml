@@ -24,7 +24,7 @@ services:
     # CONTAINER_PORT: the port the application listens on inside the container (default: 3001).
     #   Override this only if you need the in-container port to differ from the default.
     ports:
-      - "${HOST_PORT:-3001}:${CONTAINER_PORT:-3001}"
+      - "${HOST_PORT:-83836}:${CONTAINER_PORT:-83836}"
     environment:
       RUST_LOG: ${RUST_LOG:-info}
       DATABASE_URL: postgres://${POSTGRES_USER:-control_layer}:${POSTGRES_PASSWORD:-control_layer_password}@postgres:5432/${POSTGRES_DB:-control_layer}
