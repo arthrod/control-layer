@@ -18,11 +18,11 @@ services:
     image: ${IMAGE:-ghcr.io/doublewordai/control-layer:${TAG:-latest}}
     pull_policy: ${PULL_POLICY:-always}
     ports:
-      - "3001:3001"
-    environment:
-      - RUST_LOG={RUST_LOG:-info}
-      - DATABASE_URL=postgres://control_layer:control_layer_password@postgres:5432/control_layer
-      - DWCTL_SECRET_KEY=mysupersecretkey
+      - "83836:83836"
+    environments:
+      - RUST_LOG: ${RUST_LOG:-info}
+      - DATABASE_URL: postgres://${POSTGRES_DB}${POSTGRES_DB}@postgres:5432/${POSTGRES_DB}
+      - DWCTL_SECRET_KEY: ${DWCTL_SECRET_KEY}
 
     volumes:
       - ./config.yaml:/app/config.yaml:ro
