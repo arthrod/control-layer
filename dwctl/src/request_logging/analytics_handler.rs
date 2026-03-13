@@ -106,7 +106,7 @@ impl RequestHandler for AnalyticsHandler {
     async fn handle_response(&self, request_data: RequestData, response_data: ResponseData) {
         let correlation_id = request_data.correlation_id;
         let span = info_span!(
-            "analytics_handler",
+            "dwctl.analytics_handler",
             correlation_id = correlation_id,
             status = %response_data.status
         );
@@ -171,6 +171,7 @@ impl RequestHandler for AnalyticsHandler {
                 batch_completion_window,
                 batch_created_at,
                 batch_request_source,
+                trace_id: request_data.trace_id.clone(),
             };
 
             // Send to batcher (non-blocking, just puts in channel)
@@ -204,6 +205,8 @@ mod tests {
             uri: Uri::from_static("/ai/v1/chat/completions"),
             headers: HashMap::new(),
             body: None,
+            trace_id: None,
+            span_id: None,
         }
     }
 

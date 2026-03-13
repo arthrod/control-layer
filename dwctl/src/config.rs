@@ -170,6 +170,10 @@ pub struct Config {
     pub email: EmailConfig,
     /// Onwards proxy configuration
     pub onwards: OnwardsConfig,
+    /// Optional URL to redirect new users to for onboarding (e.g., "https://onboarding.doubleword.ai")
+    /// When set, users with a null `last_login` will receive this URL in the `/users/current` response.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub onboarding_url: Option<String>,
 }
 
 /// Individual pool configuration with all SQLx parameters.
@@ -655,6 +659,8 @@ pub struct SessionConfig {
     pub cookie_secure: bool,
     /// SameSite cookie attribute ("strict", "lax", or "none")
     pub cookie_same_site: String,
+    /// Optional Domain attribute for cookies (e.g. ".doubleword.ai" for cross-subdomain)
+    pub cookie_domain: Option<String>,
 }
 
 /// Password validation rules.
@@ -1049,8 +1055,27 @@ pub struct DaemonConfig {
     /// Maximum backoff time in milliseconds (default: 10000)
     pub max_backoff_ms: u64,
 
-    /// Timeout for each individual request attempt in milliseconds (default: 600000 = 10 minutes)
-    pub timeout_ms: u64,
+    /// Deprecated: use first_chunk_timeout_ms, chunk_timeout_ms, and body_timeout_ms instead.
+    /// If set, splits into 90% first_chunk_timeout_ms and 10% body_timeout_ms.
+    /// Ignored when the granular timeout fields are explicitly set.
+    pub timeout_ms: Option<u64>,
+
+    /// Timeout for receiving response headers (connect + time-to-first-token) in milliseconds.
+    /// This should be generous enough to cover slow model inference starts.
+    /// Default: 86,400,000 (24 hours).
+    pub first_chunk_timeout_ms: u64,
+
+    /// Timeout for receiving the next chunk of response body in milliseconds.
+    /// Once the server starts streaming, each inter-chunk gap must be shorter
+    /// than this value or the request is considered stalled.
+    /// Default: 86,400,000 (24 hours).
+    pub chunk_timeout_ms: u64,
+
+    /// Timeout for the entire response body in milliseconds.
+    /// Catches slow-drip responses that never trip the per-chunk timeout
+    /// but take an unreasonable total time.
+    /// Default: 86,400,000 (24 hours).
+    pub body_timeout_ms: u64,
 
     /// Interval for logging daemon status (requests in flight) in milliseconds
     /// Set to None to disable periodic status logging (default: Some(2000))
@@ -1123,7 +1148,10 @@ impl Default for DaemonConfig {
             backoff_ms: 1000,
             backoff_factor: 2,
             max_backoff_ms: 10000,
-            timeout_ms: 600000,
+            timeout_ms: None,
+            first_chunk_timeout_ms: 86_400_000,
+            chunk_timeout_ms: 86_400_000,
+            body_timeout_ms: 86_400_000,
             status_log_interval_ms: Some(2000),
             claim_timeout_ms: 60000,
             processing_timeout_ms: 600000,
@@ -1146,6 +1174,24 @@ impl DaemonConfig {
         &self,
         model_capacity_limits: Option<std::sync::Arc<dashmap::DashMap<String, usize>>>,
     ) -> fusillade::daemon::DaemonConfig {
+        // If the deprecated timeout_ms is set and the granular fields are at their
+        // defaults, split it: 90% header (connect + TTFT), 10% body.
+        let (first_chunk_timeout_ms, chunk_timeout_ms, body_timeout_ms) = if let Some(timeout) = self.timeout_ms {
+            if self.first_chunk_timeout_ms == 86_400_000 && self.chunk_timeout_ms == 86_400_000 && self.body_timeout_ms == 86_400_000 {
+                tracing::warn!(
+                    timeout_ms = timeout,
+                    "batch_daemon.timeout_ms is deprecated; \
+                         use first_chunk_timeout_ms, chunk_timeout_ms, and body_timeout_ms instead"
+                );
+                (timeout * 9 / 10, 86_400_000, timeout / 10)
+            } else {
+                // Granular fields were explicitly set — ignore deprecated field
+                (self.first_chunk_timeout_ms, self.chunk_timeout_ms, self.body_timeout_ms)
+            }
+        } else {
+            (self.first_chunk_timeout_ms, self.chunk_timeout_ms, self.body_timeout_ms)
+        };
+
         fusillade::daemon::DaemonConfig {
             claim_batch_size: self.claim_batch_size,
             model_concurrency_limits: model_capacity_limits.unwrap_or_else(|| std::sync::Arc::new(dashmap::DashMap::new())),
@@ -1156,7 +1202,9 @@ impl DaemonConfig {
             backoff_ms: self.backoff_ms,
             backoff_factor: self.backoff_factor,
             max_backoff_ms: self.max_backoff_ms,
-            timeout_ms: self.timeout_ms,
+            first_chunk_timeout_ms,
+            chunk_timeout_ms,
+            body_timeout_ms,
             status_log_interval_ms: self.status_log_interval_ms,
             claim_timeout_ms: self.claim_timeout_ms,
             processing_timeout_ms: self.processing_timeout_ms,
@@ -1482,6 +1530,7 @@ impl Default for Config {
             limits: LimitsConfig::default(),
             email: EmailConfig::default(),
             onwards: OnwardsConfig::default(),
+            onboarding_url: None,
         }
     }
 }
@@ -1532,6 +1581,7 @@ impl Default for SessionConfig {
             cookie_name: "dwctl_session".to_string(),
             cookie_secure: true,
             cookie_same_site: "strict".to_string(),
+            cookie_domain: None,
         }
     }
 }
@@ -1640,6 +1690,11 @@ impl Config {
             }
         }
 
+        // Normalize empty cookie_domain to None (allows env var override with "" to clear it)
+        if config.auth.native.session.cookie_domain.as_deref() == Some("") {
+            config.auth.native.session.cookie_domain = None;
+        }
+
         config.validate().map_err(|e| figment::Error::from(e.to_string()))?;
         Ok(config)
     }
@@ -1701,6 +1756,26 @@ impl Config {
                     "Config validation: No authentication methods are enabled. Please enable either native or proxy_header authentication."
                         .to_string(),
             });
+        }
+
+        // Validate cookie_domain if set — must produce a valid Set-Cookie header fragment
+        if let Some(ref domain) = self.auth.native.session.cookie_domain {
+            let invalid = domain.is_empty() || domain.chars().any(|c| c.is_whitespace() || c.is_control()) || domain.contains(';');
+            if invalid {
+                return Err(Error::Internal {
+                    operation: format!(
+                        "Config validation: Invalid cookie_domain '{domain}'. \
+                         Must not be empty or contain semicolons, whitespace, or control characters."
+                    ),
+                });
+            }
+            // Verify the resulting fragment is a valid HTTP header value
+            let fragment = format!("; Domain={domain}");
+            if axum::http::HeaderValue::from_str(&fragment).is_err() {
+                return Err(Error::Internal {
+                    operation: format!("Config validation: cookie_domain '{domain}' produces an invalid HTTP header value."),
+                });
+            }
         }
 
         // Validate CORS configuration
@@ -2609,6 +2684,35 @@ batches:
             // No relaxation_factors key — all windows default to 1.0
             assert_eq!(config.batches.relaxation_factor("1h"), 1.0);
             assert_eq!(config.batches.relaxation_factor("24h"), 1.0);
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_empty_cookie_domain_env_override_normalized_to_none() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: "test-secret-key"
+auth:
+  native:
+    session:
+      cookie_domain: ".doubleword.ai"
+"#,
+            )?;
+
+            // Staging overrides cookie_domain with empty string to clear it
+            jail.set_env("DWCTL_AUTH__NATIVE__SESSION__COOKIE_DOMAIN", "");
+
+            let args = Args {
+                config: "test.yaml".to_string(),
+                validate: false,
+            };
+
+            let config = Config::load(&args)?;
+            assert_eq!(config.auth.native.session.cookie_domain, None);
+
             Ok(())
         });
     }

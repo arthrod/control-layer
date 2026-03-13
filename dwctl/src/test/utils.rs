@@ -36,7 +36,7 @@ pub async fn create_test_app_state_with_config(pool: PgPool, config: crate::conf
         .await
         .expect("Failed to create fusillade TestDbPools");
 
-    let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(fusillade_pools));
+    let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(fusillade_pools, Default::default()));
     let limiters = crate::limits::Limiters::new(&config.limits);
 
     crate::AppState::builder()
@@ -74,7 +74,7 @@ pub async fn create_test_app_state_with_fusillade(pool: PgPool, config: crate::c
     let fusillade_test_pools = TestDbPools::new(fusillade_pool)
         .await
         .expect("Failed to create fusillade TestDbPools");
-    let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(fusillade_test_pools));
+    let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(fusillade_test_pools, Default::default()));
     let limiters = crate::limits::Limiters::new(&config.limits);
 
     crate::AppState::builder()
@@ -219,6 +219,7 @@ pub fn create_test_config() -> crate::config::Config {
             ..Default::default()
         },
         onwards: crate::config::OnwardsConfig::default(),
+        onboarding_url: None,
     }
 }
 
@@ -368,6 +369,7 @@ pub async fn get_system_user(pool: &mut PgConnection) -> UserResponse {
         user_type: "individual".to_string(),
         organizations: None,
         active_organization_id: None,
+        onboarding_redirect_url: None,
     }
 }
 
@@ -546,6 +548,7 @@ pub async fn create_test_org(pool: &PgPool, created_by: UserId) -> UserResponse 
         user_type: org.user_type,
         organizations: None,
         active_organization_id: None,
+        onboarding_redirect_url: None,
     }
 }
 

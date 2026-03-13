@@ -366,7 +366,7 @@ pub async fn create_initial_admin_user(
         // User exists - update password if provided
         if let Some(password_hash) = password_hash {
             // Update password using raw SQL since we don't have a password update method
-            sqlx::query!("UPDATE users SET password_hash = $1 WHERE email = $2", password_hash, email)
+            sqlx::query!("UPDATE users SET password_hash = $1 WHERE id = $2", password_hash, existing_user.id)
                 .execute(&mut *tx)
                 .await?;
         }
@@ -964,6 +964,7 @@ pub async fn build_router(
                 capture_request_body: true,
                 capture_response_body: true,
                 path_filter: None, // No path filter needed - applied directly to ai_router
+                ..Default::default()
             };
             Some(RequestLoggerLayer::new(outlet_config, multi_handler))
         }
@@ -1698,17 +1699,17 @@ async fn setup_background_services(
 
     // Initialize the fusillade request manager (for batch processing)
     let request_manager = Arc::new(
-        fusillade::PostgresRequestManager::new(fusillade_pools)
-            .with_config(
-                config
-                    .background_services
-                    .batch_daemon
-                    .to_fusillade_config_with_limits(Some(model_capacity_limits.clone())),
-            )
-            .with_download_buffer_size(config.batches.files.download_buffer_size)
-            .with_batch_insert_strategy(BatchInsertStrategy::Batched {
-                batch_size: config.batches.files.batch_insert_size,
-            }),
+        fusillade::PostgresRequestManager::new(
+            fusillade_pools,
+            config
+                .background_services
+                .batch_daemon
+                .to_fusillade_config_with_limits(Some(model_capacity_limits.clone())),
+        )
+        .with_download_buffer_size(config.batches.files.download_buffer_size)
+        .with_batch_insert_strategy(BatchInsertStrategy::Batched {
+            batch_size: config.batches.files.batch_insert_size,
+        }),
     );
 
     let is_leader: bool;
