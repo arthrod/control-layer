@@ -3,7 +3,7 @@ export const queryKeys = {
   // Users
   users: {
     all: ["users"] as const,
-    query: (options?: { include?: string; skip?: number; limit?: number }) =>
+    query: (options?: { include?: string; skip?: number; limit?: number; search?: string }) =>
       ["users", "query", options] as const,
     byId: (id: string, include?: string) =>
       ["users", "byId", id, include] as const,
@@ -35,6 +35,13 @@ export const queryKeys = {
       is_composite?: boolean;
       group?: string;
     }) => ["models", "metrics", options] as const,
+  },
+
+  providerDisplayConfigs: {
+    all: ["providerDisplayConfigs"] as const,
+    query: () => ["providerDisplayConfigs", "query"] as const,
+    byKey: (providerKey: string) =>
+      ["providerDisplayConfigs", "byKey", providerKey] as const,
   },
 
   // Groups

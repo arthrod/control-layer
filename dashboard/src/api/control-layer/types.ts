@@ -9,6 +9,7 @@ export interface PaginatedResponse<T> {
 }
 
 export type ModelType = "CHAT" | "EMBEDDINGS" | "RERANKER";
+export type ModelDisplayCategory = "generation" | "embedding" | "ocr";
 
 // Virtual model types (virtual models route requests across multiple hosted models)
 export type LoadBalancingStrategy = "weighted_random" | "priority";
@@ -153,21 +154,48 @@ export interface TariffDefinition {
 // Model metadata (enriched model information from provider data)
 export interface ModelMetadata {
   provider?: string;
+  display_category?: ModelDisplayCategory;
   intelligence_index?: number;
   context_window?: number;
   released_at?: string; // ISO date string (YYYY-MM-DD)
   attribution?: string;
+  quantization?: string; // e.g. "FP8", "FP16", "INT4"
   extra?: {
     evaluations?: Record<string, number>;
     summary?: string; // Short one-line description for catalog views
     use_cases?: string[]; // e.g., ["Research & analysis", "High volume tasks"]
+    model_order?: number;
+    deployment_providers?: string[]; // e.g., ["snowflake", "onwards"]
   };
+}
+
+export interface ProviderDisplayConfig {
+  provider_key: string;
+  display_name: string;
+  icon?: string | null;
+  model_count: number;
+  configured: boolean;
+  created_by?: string | null;
+  created_at?: string | null;
+  updated_at?: string | null;
+}
+
+export interface ProviderDisplayConfigCreateRequest {
+  provider_key: string;
+  display_name?: string;
+  icon?: string;
+}
+
+export interface ProviderDisplayConfigUpdateRequest {
+  display_name?: string;
+  icon?: string | null;
 }
 
 // Base model types
 export interface Model {
   id: string;
   alias: string;
+  display_name?: string | null;
   model_name: string;
   description?: string | null;
   model_type?: ModelType | null;
@@ -201,6 +229,7 @@ export interface StandardModelCreate {
   type: "standard";
   model_name: string;
   alias?: string;
+  display_name?: string;
   hosted_on: string; // endpoint ID (UUID)
   description?: string;
   model_type?: ModelType;
@@ -222,6 +251,7 @@ export interface VirtualModelCreate {
   type: "composite" | "virtual"; // API accepts "composite", UI uses "virtual"
   model_name: string;
   alias?: string;
+  display_name?: string;
   description?: string;
   model_type?: ModelType;
   capabilities?: string[];
@@ -308,6 +338,8 @@ export interface User {
   user_type?: "individual" | "organization"; // User type
   organizations?: OrganizationSummary[]; // only present when include=organizations or for current user
   active_organization_id?: string; // only present for /users/current
+  last_login?: string | null; // ISO 8601 timestamp, null if user has never logged in
+  onboarding_redirect_url?: string; // only present for /users/current when last_login is null
 }
 
 export interface ApiKey {
@@ -446,6 +478,7 @@ export interface GroupUpdateRequest {
 
 export interface ModelUpdateRequest {
   alias?: string;
+  display_name?: string | null;
   description?: string | null;
   model_type?: ModelType | null;
   capabilities?: string[] | null;
@@ -1009,6 +1042,12 @@ export interface FileObject {
     | "vision"
     | "user_data"
     | "evals";
+  /** Email of the individual who created this file */
+  created_by_email?: string;
+  /** "Personal" or org name */
+  context_name?: string;
+  /** "personal" or "organization" */
+  context_type?: string;
 }
 
 export interface FileListResponse {
@@ -1042,6 +1081,8 @@ export interface FilesListQuery {
   purpose?: string;
   search?: string;
   own?: boolean;
+  /** Filter by member user ID (for per-member filtering within orgs) */
+  member_id?: string;
 }
 
 export interface ModelCostBreakdown {
@@ -1125,6 +1166,7 @@ export interface Batch {
   cancelling_at?: number | null;
   cancelled_at?: number | null;
   request_counts: BatchRequestCounts;
+  /** Metadata includes: created_by, created_by_email, request_source, context_name, context_type */
   metadata?: Record<string, string>;
   usage?: BatchUsage;
   /** Included when requesting with include=analytics */
@@ -1156,6 +1198,16 @@ export interface BatchesListQuery {
   search?: string;
   /** Comma-separated list of related resources to include. Supported: "analytics" */
   include?: string;
+  /** Filter by member user ID (for per-member filtering within orgs) */
+  member_id?: string;
+  /** Filter by batch status (e.g. "completed", "in_progress", "failed") */
+  status?: string;
+  /** Only return batches created after this ISO 8601 timestamp */
+  created_after?: string;
+  /** Only return batches created before this ISO 8601 timestamp */
+  created_before?: string;
+  /** When true, sort active (non-terminal) batches before terminal ones */
+  active_first?: boolean;
 }
 
 // ===== BATCH REQUESTS (Custom endpoints beyond OpenAI spec) =====
@@ -1285,7 +1337,9 @@ export interface DaemonConfig {
   backoff_ms: number;
   backoff_factor: number;
   max_backoff_ms: number;
-  timeout_ms: number;
+  first_chunk_timeout_ms: number;
+  chunk_timeout_ms: number;
+  body_timeout_ms: number;
   status_log_interval_ms?: number | null;
   heartbeat_interval_ms: number;
   claim_timeout_ms: number;
@@ -1315,6 +1369,8 @@ export interface DaemonsQuery {
 
 // ===== WEBHOOK TYPES =====
 
+export type WebhookScope = "own" | "platform";
+
 export interface Webhook {
   id: string;
   user_id: string;
@@ -1322,6 +1378,7 @@ export interface Webhook {
   enabled: boolean;
   event_types?: string[] | null;
   description?: string | null;
+  scope: WebhookScope;
   created_at: string;
   updated_at: string;
   disabled_at?: string | null;
@@ -1335,6 +1392,7 @@ export interface WebhookCreateRequest {
   url: string;
   event_types?: string[];
   description?: string;
+  scope?: WebhookScope;
 }
 
 export interface WebhookUpdateRequest {
@@ -1378,6 +1436,8 @@ export interface OrganizationCreateRequest {
 export interface OrganizationUpdateRequest {
   display_name?: string;
   email?: string;
+  batch_notifications_enabled?: boolean;
+  low_balance_threshold?: number | null;
 }
 
 export interface InviteMemberRequest {

@@ -155,12 +155,12 @@ impl GenAiMetrics {
 
 #[async_trait]
 impl MetricsRecorder for GenAiMetrics {
-    #[instrument(skip_all)]
+    #[instrument(skip_all, name = "dwctl.record_from_analytics")]
     async fn record_from_analytics(&self, row: &HttpAnalyticsRow) {
         // Extract operation from response_type
         let operation = match row.response_type.as_str() {
             "chat_completion" | "chat_completion_stream" => "chat",
-            "completion" => "text_completion",
+            "completion" | "completion_stream" => "text_completion",
             "embeddings" | "base64_embeddings" => "embeddings",
             _ => "",
         };

@@ -40,7 +40,7 @@
 //! [outlet]: https://github.com/doublewordai/outlet
 
 use crate::config::Config;
-use crate::request_logging::models::{AiRequest, AiResponse, ChatCompletionChunk, ParsedAIRequest, ResponsesRequest};
+use crate::request_logging::models::{AiRequest, AiResponse, ChatCompletionChunk, CompletionChunk, ParsedAIRequest, ResponsesRequest};
 use async_openai::types::responses::ResponseStreamEvent;
 use outlet::{RequestData, ResponseData};
 use outlet_postgres::SerializationError;
@@ -152,7 +152,7 @@ pub struct UsageMetrics {
 /// - On parse failure, returns error with base64-encoded body for safe PostgreSQL storage
 /// - For `/v1/responses` paths, uses path-based detection to avoid serde disambiguation
 ///   issues with the embeddings variant (both use an `input` field).
-#[instrument(skip_all)]
+#[instrument(skip_all, name = "dwctl.parse_ai_request")]
 pub fn parse_ai_request(request_data: &RequestData) -> Result<ParsedAIRequest, SerializationError> {
     let headers = request_data
         .headers
@@ -237,7 +237,7 @@ pub fn parse_ai_request(request_data: &RequestData) -> Result<ParsedAIRequest, S
 /// - Handles gzip/brotli decompression based on Content-Encoding headers
 /// - Parses streaming responses (SSE format) vs non-streaming based on request stream parameter
 /// - On parse failure, returns error with base64-encoded decompressed body
-#[instrument(skip_all)]
+#[instrument(skip_all, name = "dwctl.parse_ai_response")]
 pub fn parse_ai_response(request_data: &RequestData, response_data: &ResponseData) -> Result<AiResponse, SerializationError> {
     let bytes = match &response_data.body {
         Some(body) => body.as_ref(),
@@ -255,12 +255,22 @@ pub fn parse_ai_response(request_data: &RequestData, response_data: &ResponseDat
         return Ok(AiResponse::Other(Value::Null));
     }
 
+    // Onwards injects stream:true into the forwarded body when it sees this header,
+    // but outlet captures the original request body (without stream:true). Check the
+    // header so we know to use the streaming parser for the response.
+    let fusillade_stream = request_data
+        .headers
+        .get("x-fusillade-stream")
+        .and_then(|values| values.first())
+        .and_then(|bytes| std::str::from_utf8(bytes).ok())
+        == Some("true");
+
     // Parse response based on request type
     let result = match parse_ai_request(request_data) {
         Ok(parsed_request) => {
             // /v1/responses has its own SSE event format distinct from chat completions.
             if let Some(responses_req) = &parsed_request.responses_request {
-                if responses_req.stream.unwrap_or(false) {
+                if responses_req.stream.unwrap_or(false) || fusillade_stream {
                     utils::parse_responses_streaming_response(&body_str)
                 } else {
                     // Try the typed Response parser first. Fall back to the generic untagged
@@ -270,9 +280,11 @@ pub fn parse_ai_response(request_data: &RequestData, response_data: &ResponseDat
                 }
             } else {
                 match parsed_request.request {
-                    AiRequest::ChatCompletions(chat_req) if chat_req.stream.unwrap_or(false) => utils::parse_streaming_response(&body_str),
-                    AiRequest::Completions(completion_req) if completion_req.stream.unwrap_or(false) => {
+                    AiRequest::ChatCompletions(chat_req) if chat_req.stream.unwrap_or(false) || fusillade_stream => {
                         utils::parse_streaming_response(&body_str)
+                    }
+                    AiRequest::Completions(completion_req) if completion_req.stream.unwrap_or(false) || fusillade_stream => {
+                        utils::parse_completions_streaming_response(&body_str)
                     }
                     _ => utils::parse_non_streaming_response(&body_str),
                 }
@@ -302,7 +314,7 @@ impl UsageMetrics {
     ///
     /// # Returns
     /// A `UsageMetrics` struct with extracted model, tokens, and timing data
-    #[instrument(skip_all, name = "extract_usage_metrics")]
+    #[instrument(skip_all, name = "dwctl.extract_usage_metrics")]
     pub fn extract(
         instance_id: Uuid,
         request_data: &RequestData,
@@ -367,7 +379,7 @@ impl UsageMetrics {
 
 impl Auth {
     /// Extract authentication from request headers
-    #[instrument(skip_all, name = "extract_auth")]
+    #[instrument(skip_all, name = "dwctl.extract_auth")]
     pub fn from_request(request_data: &RequestData, _config: &Config) -> Self {
         // Check for API key in Authorization header
         if let Some(auth_header) = Self::get_header_value(request_data, "authorization")
@@ -462,6 +474,45 @@ impl From<&AiResponse> for TokenMetrics {
                         completion_tokens: 0,
                         total_tokens: 0,
                         response_type: "chat_completion_stream".to_string(),
+                        response_model: model,
+                    }
+                }
+            }
+            AiResponse::CompletionsStream(chunks) => {
+                let last_normal_with_usage = chunks.iter().rev().find_map(|chunk| match chunk {
+                    CompletionChunk::Normal(normal_chunk) if normal_chunk.usage.is_some() => Some(normal_chunk),
+                    _ => None,
+                });
+
+                let model = chunks.iter().find_map(|chunk| match chunk {
+                    CompletionChunk::Normal(c) => Some(c.model.clone()),
+                    _ => None,
+                });
+
+                if let Some(chunk) = last_normal_with_usage {
+                    if let Some(usage) = &chunk.usage {
+                        Self {
+                            prompt_tokens: usage.prompt_tokens as i64,
+                            completion_tokens: usage.completion_tokens as i64,
+                            total_tokens: usage.total_tokens as i64,
+                            response_type: "completion_stream".to_string(),
+                            response_model: model,
+                        }
+                    } else {
+                        Self {
+                            prompt_tokens: 0,
+                            completion_tokens: 0,
+                            total_tokens: 0,
+                            response_type: "completion_stream".to_string(),
+                            response_model: model,
+                        }
+                    }
+                } else {
+                    Self {
+                        prompt_tokens: 0,
+                        completion_tokens: 0,
+                        total_tokens: 0,
+                        response_type: "completion_stream".to_string(),
                         response_model: model,
                     }
                 }
@@ -590,6 +641,8 @@ mod tests {
             uri: "/test".parse::<Uri>().unwrap(),
             headers: HashMap::new(),
             body: None,
+            trace_id: None,
+            span_id: None,
         };
 
         let result = parse_ai_request(&request_data).unwrap();
@@ -609,6 +662,8 @@ mod tests {
             uri: "/test".parse::<Uri>().unwrap(),
             headers: HashMap::new(),
             body: Some(Bytes::new()), // Empty bytes
+            trace_id: None,
+            span_id: None,
         };
 
         let result = parse_ai_request(&request_data).unwrap();
@@ -628,6 +683,8 @@ mod tests {
             uri: "/test".parse::<Uri>().unwrap(),
             headers: HashMap::new(),
             body: Some(Bytes::from("invalid json")),
+            trace_id: None,
+            span_id: None,
         };
 
         let result = parse_ai_request(&request_data);
@@ -647,6 +704,8 @@ mod tests {
             uri: "/test".parse::<Uri>().unwrap(),
             headers: HashMap::new(),
             body: Some(Bytes::from(json_body)),
+            trace_id: None,
+            span_id: None,
         };
 
         let result = parse_ai_request(&request_data).unwrap();
@@ -670,6 +729,8 @@ mod tests {
             uri: "/test".parse::<Uri>().unwrap(),
             headers: HashMap::new(),
             body: Some(Bytes::from(json_body)),
+            trace_id: None,
+            span_id: None,
         };
 
         let result = parse_ai_request(&request_data).unwrap();
@@ -692,6 +753,8 @@ mod tests {
             uri: "/test".parse::<Uri>().unwrap(),
             headers: HashMap::new(),
             body: Some(Bytes::from(json_body)),
+            trace_id: None,
+            span_id: None,
         };
 
         let result = parse_ai_request(&request_data).unwrap();
@@ -713,6 +776,8 @@ mod tests {
             uri: "/test".parse::<Uri>().unwrap(),
             headers: HashMap::new(),
             body: None,
+            trace_id: None,
+            span_id: None,
         };
 
         let response_data = ResponseData {
@@ -742,6 +807,8 @@ mod tests {
             uri: "/test".parse::<Uri>().unwrap(),
             headers: HashMap::new(),
             body: None,
+            trace_id: None,
+            span_id: None,
         };
 
         let response_data = ResponseData {
@@ -771,6 +838,8 @@ mod tests {
             uri: "/test".parse::<Uri>().unwrap(),
             headers: HashMap::new(),
             body: None,
+            trace_id: None,
+            span_id: None,
         };
 
         let json_response = r#"{
@@ -814,6 +883,8 @@ mod tests {
             uri: "/test".parse::<Uri>().unwrap(),
             headers: HashMap::new(),
             body: Some(Bytes::from(request_json)),
+            trace_id: None,
+            span_id: None,
         };
 
         // SSE streaming response
@@ -840,6 +911,106 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_ai_response_fusillade_stream_header() {
+        // Request body has stream: false, but x-fusillade-stream header is set.
+        // Outlet captures the original body before onwards injects stream:true,
+        // so the header is the only signal that the response is SSE.
+        let request_json = r#"{"model": "gpt-4", "messages": [{"role": "user", "content": "hello"}], "stream": false}"#;
+        let mut headers = HashMap::new();
+        headers.insert("x-fusillade-stream".to_string(), vec![Bytes::from("true")]);
+        let request_data = RequestData {
+            correlation_id: 123,
+            timestamp: SystemTime::now(),
+            method: Method::POST,
+            uri: "/test".parse::<Uri>().unwrap(),
+            headers,
+            body: Some(Bytes::from(request_json)),
+            trace_id: None,
+            span_id: None,
+        };
+
+        let sse_response = "data: {\"id\":\"chatcmpl-123\",\"object\":\"chat.completion.chunk\",\"created\":1677652288,\"model\":\"gpt-4\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"}}],\"usage\":null}\n\ndata: {\"id\":\"chatcmpl-123\",\"object\":\"chat.completion.chunk\",\"created\":1677652288,\"model\":\"gpt-4\",\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}\n\ndata: [DONE]\n\n";
+
+        let response_data = ResponseData {
+            correlation_id: 123,
+            timestamp: SystemTime::now(),
+            status: StatusCode::OK,
+            headers: HashMap::new(),
+            body: Some(Bytes::from(sse_response)),
+            duration: Duration::from_millis(100),
+            duration_to_first_byte: Duration::from_millis(50),
+        };
+
+        let result = parse_ai_response(&request_data, &response_data).unwrap();
+
+        match &result {
+            AiResponse::ChatCompletionsStream(chunks) => {
+                assert!(!chunks.is_empty(), "Expected parsed SSE chunks");
+                // Verify usage is extractable (this is what billing uses)
+                let metrics = UsageMetrics::extract(
+                    uuid::Uuid::nil(),
+                    &request_data,
+                    &response_data,
+                    &result,
+                    &crate::config::Config::default(),
+                );
+                assert_eq!(metrics.prompt_tokens, 10);
+                assert_eq!(metrics.completion_tokens, 5);
+                assert_eq!(metrics.total_tokens, 15);
+            }
+            other => panic!("Expected ChatCompletionsStream, got {:?}", std::mem::discriminant(other)),
+        }
+    }
+
+    #[test]
+    fn test_parse_ai_response_fusillade_completions_stream() {
+        let request_json = r#"{"model": "gpt-3.5-turbo-instruct", "prompt": "Hello", "stream": false}"#;
+        let mut headers = HashMap::new();
+        headers.insert("x-fusillade-stream".to_string(), vec![Bytes::from("true")]);
+        let request_data = RequestData {
+            correlation_id: 123,
+            timestamp: SystemTime::now(),
+            method: Method::POST,
+            uri: "/test".parse::<Uri>().unwrap(),
+            headers,
+            body: Some(Bytes::from(request_json)),
+            trace_id: None,
+            span_id: None,
+        };
+
+        let sse_response = "data: {\"id\":\"cmpl-123\",\"object\":\"text_completion\",\"created\":1677652288,\"model\":\"gpt-3.5-turbo-instruct\",\"choices\":[{\"text\":\" world\",\"index\":0}]}\n\ndata: {\"id\":\"cmpl-123\",\"object\":\"text_completion\",\"created\":1677652288,\"model\":\"gpt-3.5-turbo-instruct\",\"choices\":[],\"usage\":{\"prompt_tokens\":8,\"completion_tokens\":12,\"total_tokens\":20}}\n\ndata: [DONE]\n\n";
+
+        let response_data = ResponseData {
+            correlation_id: 123,
+            timestamp: SystemTime::now(),
+            status: StatusCode::OK,
+            headers: HashMap::new(),
+            body: Some(Bytes::from(sse_response)),
+            duration: Duration::from_millis(100),
+            duration_to_first_byte: Duration::from_millis(50),
+        };
+
+        let result = parse_ai_response(&request_data, &response_data).unwrap();
+
+        match &result {
+            AiResponse::CompletionsStream(chunks) => {
+                assert!(!chunks.is_empty(), "Expected parsed SSE chunks");
+                let metrics = UsageMetrics::extract(
+                    uuid::Uuid::nil(),
+                    &request_data,
+                    &response_data,
+                    &result,
+                    &crate::config::Config::default(),
+                );
+                assert_eq!(metrics.prompt_tokens, 8);
+                assert_eq!(metrics.completion_tokens, 12);
+                assert_eq!(metrics.total_tokens, 20);
+            }
+            other => panic!("Expected CompletionsStream, got {:?}", std::mem::discriminant(other)),
+        }
+    }
+
+    #[test]
     fn test_parse_ai_response_embeddings() {
         let request_data = RequestData {
             correlation_id: 123,
@@ -848,6 +1019,8 @@ mod tests {
             uri: "/test".parse::<Uri>().unwrap(),
             headers: HashMap::new(),
             body: None,
+            trace_id: None,
+            span_id: None,
         };
 
         let embeddings_response = r#"{
@@ -887,6 +1060,8 @@ mod tests {
             uri: "/test".parse::<Uri>().unwrap(),
             headers: HashMap::new(),
             body: None,
+            trace_id: None,
+            span_id: None,
         };
 
         let response_data = ResponseData {
@@ -917,6 +1092,8 @@ mod tests {
             uri: "/v1/chat/completions".parse::<Uri>().unwrap(),
             headers: HashMap::new(),
             body: None,
+            trace_id: None,
+            span_id: None,
         };
 
         let response_data = ResponseData {
@@ -967,6 +1144,8 @@ mod tests {
             uri: "/v1/chat/completions".parse::<Uri>().unwrap(),
             headers: HashMap::new(),
             body: Some(Bytes::from(request_json)),
+            trace_id: None,
+            span_id: None,
         };
 
         let response_data = ResponseData {
@@ -1033,6 +1212,8 @@ mod tests {
             uri: "/v1/chat/completions".parse::<Uri>().unwrap(),
             headers: HashMap::new(),
             body: None,
+            trace_id: None,
+            span_id: None,
         };
 
         let response_data = ResponseData {
@@ -1092,6 +1273,8 @@ mod tests {
             uri: "/v1/embeddings".parse::<Uri>().unwrap(),
             headers: HashMap::new(),
             body: None,
+            trace_id: None,
+            span_id: None,
         };
 
         let response_data = ResponseData {
@@ -1141,6 +1324,8 @@ mod tests {
             uri: "/v1/completions".parse::<Uri>().unwrap(),
             headers: HashMap::new(),
             body: None,
+            trace_id: None,
+            span_id: None,
         };
 
         let response_data = ResponseData {
@@ -1197,6 +1382,8 @@ mod tests {
             uri: "/v1/embeddings".parse::<Uri>().unwrap(),
             headers: HashMap::new(),
             body: None,
+            trace_id: None,
+            span_id: None,
         };
 
         let response_data = ResponseData {
@@ -1261,6 +1448,8 @@ mod tests {
             uri: "/v1/responses".parse::<Uri>().unwrap(),
             headers: HashMap::new(),
             body: Some(Bytes::from(body)),
+            trace_id: None,
+            span_id: None,
         }
     }
 

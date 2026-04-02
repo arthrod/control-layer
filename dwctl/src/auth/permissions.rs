@@ -151,6 +151,15 @@ pub mod resource {
             Resource::Organizations
         }
     }
+
+    #[derive(Default)]
+    pub struct ToolSources;
+
+    impl From<ToolSources> for Resource {
+        fn from(_: ToolSources) -> Resource {
+            Resource::ToolSources
+        }
+    }
 }
 
 pub mod operation {
@@ -325,8 +334,9 @@ pub fn role_has_permission(role: &Role, resource: Resource, operation: Operation
                     | (Resource::Webhooks, Operation::ReadOwn)    // Can read own webhooks
                     | (Resource::Webhooks, Operation::UpdateOwn)  // Can update own webhooks
                     | (Resource::Webhooks, Operation::DeleteOwn) // Can delete own webhooks
-                    | (Resource::Organizations, Operation::ReadOwn)   // Can read own organizations
-                    | (Resource::Organizations, Operation::UpdateOwn) // Can manage orgs they belong to
+                    | (Resource::Organizations, Operation::ReadOwn)    // Can read own organizations
+                    | (Resource::Organizations, Operation::UpdateOwn)  // Can manage orgs they belong to
+                    | (Resource::Organizations, Operation::CreateOwn) // Can create own organizations
             )
         }
         Role::RequestViewer => {
@@ -696,13 +706,19 @@ mod tests {
         let mut conn = pool.acquire().await.unwrap();
         let mut orgs = Organizations::new(&mut conn);
         let org = orgs
-            .create(&OrganizationCreateDBRequest {
-                name: "acme".to_string(),
-                email: "org@acme.com".to_string(),
-                display_name: None,
-                avatar_url: None,
-                created_by: alice.id,
-            })
+            .create(
+                &OrganizationCreateDBRequest {
+                    name: "acme".to_string(),
+                    email: "org@acme.com".to_string(),
+                    display_name: None,
+                    avatar_url: None,
+                    created_by: alice.id,
+                },
+                &[
+                    crate::api::models::users::Role::StandardUser,
+                    crate::api::models::users::Role::BatchAPIUser,
+                ],
+            )
             .await
             .unwrap();
 
@@ -720,13 +736,19 @@ mod tests {
         let mut conn = pool.acquire().await.unwrap();
         let mut orgs = Organizations::new(&mut conn);
         let org = orgs
-            .create(&OrganizationCreateDBRequest {
-                name: "acme".to_string(),
-                email: "org@acme.com".to_string(),
-                display_name: None,
-                avatar_url: None,
-                created_by: alice.id,
-            })
+            .create(
+                &OrganizationCreateDBRequest {
+                    name: "acme".to_string(),
+                    email: "org@acme.com".to_string(),
+                    display_name: None,
+                    avatar_url: None,
+                    created_by: alice.id,
+                },
+                &[
+                    crate::api::models::users::Role::StandardUser,
+                    crate::api::models::users::Role::BatchAPIUser,
+                ],
+            )
             .await
             .unwrap();
         orgs.add_member(org.id, bob.id, "member").await.unwrap();
@@ -745,13 +767,19 @@ mod tests {
         let mut conn = pool.acquire().await.unwrap();
         let mut orgs = Organizations::new(&mut conn);
         let org = orgs
-            .create(&OrganizationCreateDBRequest {
-                name: "acme".to_string(),
-                email: "org@acme.com".to_string(),
-                display_name: None,
-                avatar_url: None,
-                created_by: alice.id,
-            })
+            .create(
+                &OrganizationCreateDBRequest {
+                    name: "acme".to_string(),
+                    email: "org@acme.com".to_string(),
+                    display_name: None,
+                    avatar_url: None,
+                    created_by: alice.id,
+                },
+                &[
+                    crate::api::models::users::Role::StandardUser,
+                    crate::api::models::users::Role::BatchAPIUser,
+                ],
+            )
             .await
             .unwrap();
         orgs.add_member(org.id, charlie.id, "admin").await.unwrap();
@@ -770,13 +798,19 @@ mod tests {
         let mut conn = pool.acquire().await.unwrap();
         let mut orgs = Organizations::new(&mut conn);
         let org = orgs
-            .create(&OrganizationCreateDBRequest {
-                name: "acme".to_string(),
-                email: "org@acme.com".to_string(),
-                display_name: None,
-                avatar_url: None,
-                created_by: alice.id,
-            })
+            .create(
+                &OrganizationCreateDBRequest {
+                    name: "acme".to_string(),
+                    email: "org@acme.com".to_string(),
+                    display_name: None,
+                    avatar_url: None,
+                    created_by: alice.id,
+                },
+                &[
+                    crate::api::models::users::Role::StandardUser,
+                    crate::api::models::users::Role::BatchAPIUser,
+                ],
+            )
             .await
             .unwrap();
 
@@ -795,13 +829,19 @@ mod tests {
         let mut conn = pool.acquire().await.unwrap();
         let mut orgs = Organizations::new(&mut conn);
         let org = orgs
-            .create(&OrganizationCreateDBRequest {
-                name: "acme".to_string(),
-                email: "org@acme.com".to_string(),
-                display_name: None,
-                avatar_url: None,
-                created_by: alice.id, // alice = owner
-            })
+            .create(
+                &OrganizationCreateDBRequest {
+                    name: "acme".to_string(),
+                    email: "org@acme.com".to_string(),
+                    display_name: None,
+                    avatar_url: None,
+                    created_by: alice.id, // alice = owner
+                },
+                &[
+                    crate::api::models::users::Role::StandardUser,
+                    crate::api::models::users::Role::BatchAPIUser,
+                ],
+            )
             .await
             .unwrap();
         orgs.add_member(org.id, bob.id, "member").await.unwrap();
