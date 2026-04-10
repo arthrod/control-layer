@@ -97,6 +97,11 @@ const ModelInfo = lazy(() =>
     default: m.ModelInfo,
   })),
 );
+const ProviderDisplayConfigs = lazy(() =>
+  import("./components/features/models").then((m) => ({
+    default: m.ProviderDisplayConfigs,
+  })),
+);
 const Playground = lazy(() =>
   import("./components/features/playground").then((m) => ({
     default: m.Playground,
@@ -155,6 +160,11 @@ const MyOrganization = lazy(() =>
 const AcceptInvite = lazy(() =>
   import("./components/features/organizations").then((m) => ({
     default: m.AcceptInvite,
+  })),
+);
+const Connections = lazy(() =>
+  import("./components/features/connections").then((m) => ({
+    default: m.Connections,
   })),
 );
 
@@ -447,6 +457,18 @@ function AppRoutes() {
           }
         />
         <Route
+          path="/models/manage/providers"
+          element={
+            <AppLayout>
+              <ProtectedRoute path="/models/manage">
+                <Suspense fallback={<RouteLoader />}>
+                  <ProviderDisplayConfigs />
+                </Suspense>
+              </ProtectedRoute>
+            </AppLayout>
+          }
+        />
+        <Route
           path="/models/:modelId"
           element={
             <AppLayout>
@@ -566,6 +588,18 @@ function AppRoutes() {
               <ProtectedRoute path="/system">
                 <Suspense fallback={<RouteLoader />}>
                   <System />
+                </Suspense>
+              </ProtectedRoute>
+            </AppLayout>
+          }
+        />
+        <Route
+          path="/connections"
+          element={
+            <AppLayout>
+              <ProtectedRoute path="/connections">
+                <Suspense fallback={<RouteLoader />}>
+                  <Connections />
                 </Suspense>
               </ProtectedRoute>
             </AppLayout>

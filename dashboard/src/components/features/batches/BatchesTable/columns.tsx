@@ -13,6 +13,7 @@ import {
   DollarSign,
   Eye,
   Trash2,
+  Cable,
 } from "lucide-react";
 import { Button } from "../../../ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "../../../ui/tooltip";
@@ -31,8 +32,12 @@ interface ColumnActions {
   getInputFile: (batch: Batch) => any | undefined;
   onRowClick?: (batch: Batch) => void;
   batchAnalytics?: Map<string, BatchAnalytics>;
-  /** Show the User column (only for PlatformManagers who see all batches) */
+  /** Show the User column (PlatformManagers or org context) */
   showUserColumn?: boolean;
+  /** Show the Context column (personal vs org name) */
+  showContextColumn?: boolean;
+  /** Show the Source column (S3/API/UI) — gated behind PlatformManager */
+  showSourceColumn?: boolean;
 }
 
 const getStatusIcon = (status: BatchStatus) => {
@@ -97,6 +102,61 @@ const userColumn: ColumnDef<Batch> = {
   },
 };
 
+const sourceColumn: ColumnDef<Batch> = {
+  id: "source",
+  header: "Source",
+  cell: ({ row }) => {
+    const batch = row.original as Batch;
+    const source = batch.dwext?.source;
+
+    if (source === "sync") {
+      return (
+        <Tooltip delayDuration={300}>
+          <TooltipTrigger asChild>
+            <span className="inline-flex items-center gap-1 text-xs text-blue-600 cursor-default">
+              <Cable className="w-3 h-3" />
+              S3
+            </span>
+          </TooltipTrigger>
+          <TooltipContent>{batch.dwext?.source_name || "External sync"}</TooltipContent>
+        </Tooltip>
+      );
+    }
+    if (source === "api") {
+      return <span className="text-xs text-gray-500">API</span>;
+    }
+    if (source === "frontend") {
+      return <span className="text-xs text-gray-500">UI</span>;
+    }
+    return <span className="text-gray-400 text-xs">-</span>;
+  },
+};
+
+const contextColumn: ColumnDef<Batch> = {
+  id: "context",
+  header: "Context",
+  cell: ({ row }) => {
+    const batch = row.original as Batch;
+    const contextName = batch.metadata?.context_name;
+    const contextType = batch.metadata?.context_type;
+    if (!contextName) {
+      return <span className="text-gray-400">-</span>;
+    }
+    const isOrg = contextType === "organization";
+    return (
+      <span
+        className={`text-sm truncate max-w-[120px] block ${
+          isOrg
+            ? "text-blue-700 font-medium"
+            : "text-gray-500"
+        }`}
+      >
+        {contextName}
+      </span>
+    );
+  },
+};
+
 export const createBatchColumns = (
   actions: ColumnActions,
 ): ColumnDef<Batch>[] => [
@@ -123,6 +183,7 @@ export const createBatchColumns = (
     },
   },
   ...(actions.showUserColumn ? [userColumn] : []),
+  ...(actions.showContextColumn ? [contextColumn] : []),
   {
     id: "input_file",
     header: "Input File ID",
@@ -156,6 +217,7 @@ export const createBatchColumns = (
       );
     },
   },
+  ...(actions.showSourceColumn ? [sourceColumn] : []),
   {
     accessorKey: "completion_window",
     header: "Priority",

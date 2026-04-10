@@ -11,6 +11,13 @@ port: 3001
 # Used for password reset links, payment redirect URLs, and batch notification emails
 dashboard_url: "http://localhost:5173"
 
+# Onboarding redirect URL for new users (first login)
+# When set, users who have never logged in will be redirected here after authentication.
+# onboarding_url: "https://onboarding.doubleword.ai"
+
+# Email address where support requests are sent
+# support_email: "support@doubleword.ai"
+
 # Database configuration
 database:
   # Configure connectivity to an external postgres database here
@@ -245,7 +252,7 @@ batches:
   allowed_completion_windows:
     - "24h"
     - "1h"
-    # - "12h"  # Uncomment to allow 12 hour 
+    # - "12h"  # Uncomment to allow 12 hour
     # - "48h"  # Uncomment to allow 48 hour
 
   # Per-window relaxation factors for capacity acceptance.
@@ -256,8 +263,8 @@ batches:
   # Keys must be present in allowed_completion_windows.
   # Windows not listed here default to 1.0.
   window_relaxation_factors:
-    "1h": 1.0    # strict — no over-acceptance for high priority window
-    "24h": 1.25   # 25% over-acceptance — time to provision more capacity
+    "1h": 1.0 # strict — no over-acceptance for high priority window
+    "24h": 1.25 # 25% over-acceptance — time to provision more capacity
 
   # Allowed OpenAI-compatible URL paths for batch requests.
   # This is used by both /files upload validation and /batches endpoint validation.
@@ -302,6 +309,18 @@ batches:
 #     # Set to 0 for unlimited (not recommended for production)
 #     # Default: 10MB (10485760)
 #     max_body_size: 10485760
+
+# External data source connections (S3, etc.)
+# Allows users to connect external storage and sync files for batch processing.
+connections:
+  # Encryption key for connection credentials. Any string works (hashed to 32 bytes).
+  # Falls back to secret_key if not set. Set independently for production use.
+  encryption_key: null
+  sync:
+    # Default completion window for sync-created batches.
+    default_completion_window: "24h"
+    # Default endpoint for sync-created batches.
+    default_endpoint: "/v1/chat/completions"
 
 # Onwards AI proxy configuration
 # Controls behavior of the onwards routing layer for AI proxy requests
@@ -349,7 +368,10 @@ background_services:
     max_backoff_ms: 10000 # Maximum backoff duration in milliseconds
 
     # Timeout Settings
-    timeout_ms: 600000 # Timeout per request attempt (10 minutes)
+    # timeout_ms: 600000 # DEPRECATED: splits into 90% first_chunk_timeout_ms, 10% body_timeout_ms
+    first_chunk_timeout_ms: 86400000 # Max time waiting for response headers (24 hours)
+    chunk_timeout_ms: 86400000 # Max idle time between response body chunks (24 hours)
+    body_timeout_ms: 86400000 # Max total time for entire response body (24 hours)
     claim_timeout_ms: 60000 # Max time in "claimed" state before auto-unclaim (1 minute)
     processing_timeout_ms: 600000 # Max time in "processing" state before auto-unclaim (10 minutes)
 
@@ -365,6 +387,15 @@ background_services:
     #   gpt-4:  # Original model
     #     escalation_model: o1-preview  # Route to this model when near expiry
     #     escalation_threshold_seconds: 900  # Default: 900 (15 minutes before expiry)
+
+    # Endpoints that should use SSE streaming for usage tracking.
+    # Batch requests to these paths are sent with X-Fusillade-Stream: true,
+    # causing the upstream proxy to inject stream: true and stream_options.include_usage.
+    # The streamed response is reassembled into non-streaming JSON before storage.
+    streamable_endpoints:
+      - /v1/chat/completions
+      - /v1/completions
+      - /v1/responses
 
   # Batch completion notifications (emails + webhooks)
   # notifications:
@@ -384,3 +415,11 @@ background_services:
   # When disabled, all instances run as leader (useful for single-instance deployments)
   leader_election:
     enabled: true # Default: true
+
+  # External connection sync workers - process file ingestion and batch activation jobs.
+  # Set enabled: false for API-only replicas (jobs queue in Postgres for other replicas).
+  sync_workers:
+    enabled: true # Default: true
+    ingest_workers: 4 # Concurrent file ingestion workers
+    activate_workers: 1 # Batch activation workers (low to avoid capacity contention)
+    discovery_workers: 1 # Sync discovery workers

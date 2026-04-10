@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use utoipa::{IntoParams, ToSchema};
 
+use super::dwext::BatchDwExtResponse;
+
 /// Batch-level errors
 #[derive(Debug, Serialize, Deserialize, ToSchema, Clone)]
 #[schema(example = json!({
@@ -166,6 +168,10 @@ pub struct BatchResponse {
     /// Aggregated analytics metrics (only included when requested via `include=analytics`)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub analytics: Option<BatchAnalytics>,
+
+    /// Doubleword-specific extensions (source provenance, etc.)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dwext: Option<BatchDwExtResponse>,
 }
 
 /// Aggregated analytics metrics for batch requests
@@ -191,6 +197,11 @@ pub struct BatchAnalytics {
     /// Total completion tokens across all requests
     #[schema(example = 25000)]
     pub total_completion_tokens: i64,
+
+    /// Total reasoning tokens across all requests
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = 12000)]
+    pub total_reasoning_tokens: Option<i64>,
 
     /// Total tokens (prompt + completion) across all requests
     #[schema(example = 75000)]
@@ -289,12 +300,33 @@ pub struct ListBatchesQuery {
     #[param(inline)]
     pub pagination: CursorPagination,
 
-    /// Search query to filter batches by endpoint or input filename (case-insensitive substring match)
+    /// Search query to filter batches by metadata, input filename, or batch ID (case-insensitive substring match)
     pub search: Option<String>,
 
     /// Comma-separated list of related resources to include. Supported: "analytics"
     #[param(example = "analytics")]
     pub include: Option<String>,
+
+    /// Filter by member user ID (resolves to api_key_id). Available in org context for any member, or in personal context for platform managers.
+    pub member_id: Option<uuid::Uuid>,
+
+    /// Filter by batch status. Supported: "in_progress", "completed", "failed", "cancelled", "expired".
+    /// "in_progress" includes validating and finalizing sub-states. "cancelled" includes cancelling.
+    /// "expired" matches batches with SLA issues (overdue or finished past deadline).
+    pub status: Option<String>,
+
+    /// Only return batches created after this ISO 8601 timestamp
+    #[param(example = "2025-01-01T00:00:00Z")]
+    pub created_after: Option<chrono::DateTime<chrono::Utc>>,
+
+    /// Only return batches created before this ISO 8601 timestamp
+    #[param(example = "2025-12-31T23:59:59Z")]
+    pub created_before: Option<chrono::DateTime<chrono::Utc>>,
+
+    /// When true, sort active (non-terminal) batches before completed/failed/cancelled ones.
+    /// Each group is sorted by creation time (newest first). Default: false.
+    #[serde(default)]
+    pub active_first: bool,
 }
 
 /// Query parameters for batch results

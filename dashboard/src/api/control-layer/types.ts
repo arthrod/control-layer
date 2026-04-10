@@ -9,6 +9,7 @@ export interface PaginatedResponse<T> {
 }
 
 export type ModelType = "CHAT" | "EMBEDDINGS" | "RERANKER";
+export type ModelDisplayCategory = "generation" | "embedding" | "ocr";
 
 // Virtual model types (virtual models route requests across multiple hosted models)
 export type LoadBalancingStrategy = "weighted_random" | "priority";
@@ -153,21 +154,48 @@ export interface TariffDefinition {
 // Model metadata (enriched model information from provider data)
 export interface ModelMetadata {
   provider?: string;
+  display_category?: ModelDisplayCategory;
   intelligence_index?: number;
   context_window?: number;
   released_at?: string; // ISO date string (YYYY-MM-DD)
   attribution?: string;
+  quantization?: string; // e.g. "FP8", "FP16", "INT4"
   extra?: {
     evaluations?: Record<string, number>;
     summary?: string; // Short one-line description for catalog views
     use_cases?: string[]; // e.g., ["Research & analysis", "High volume tasks"]
+    model_order?: number;
+    deployment_providers?: string[]; // e.g., ["snowflake", "onwards"]
   };
+}
+
+export interface ProviderDisplayConfig {
+  provider_key: string;
+  display_name: string;
+  icon?: string | null;
+  model_count: number;
+  configured: boolean;
+  created_by?: string | null;
+  created_at?: string | null;
+  updated_at?: string | null;
+}
+
+export interface ProviderDisplayConfigCreateRequest {
+  provider_key: string;
+  display_name?: string;
+  icon?: string;
+}
+
+export interface ProviderDisplayConfigUpdateRequest {
+  display_name?: string;
+  icon?: string | null;
 }
 
 // Base model types
 export interface Model {
   id: string;
   alias: string;
+  display_name?: string | null;
   model_name: string;
   description?: string | null;
   model_type?: ModelType | null;
@@ -201,6 +229,7 @@ export interface StandardModelCreate {
   type: "standard";
   model_name: string;
   alias?: string;
+  display_name?: string;
   hosted_on: string; // endpoint ID (UUID)
   description?: string;
   model_type?: ModelType;
@@ -222,6 +251,7 @@ export interface VirtualModelCreate {
   type: "composite" | "virtual"; // API accepts "composite", UI uses "virtual"
   model_name: string;
   alias?: string;
+  display_name?: string;
   description?: string;
   model_type?: ModelType;
   capabilities?: string[];
@@ -308,13 +338,15 @@ export interface User {
   user_type?: "individual" | "organization"; // User type
   organizations?: OrganizationSummary[]; // only present when include=organizations or for current user
   active_organization_id?: string; // only present for /users/current
+  last_login?: string | null; // ISO 8601 timestamp, null if user has never logged in
+  onboarding_redirect_url?: string; // only present for /users/current when last_login is null
 }
 
 export interface ApiKey {
   id: string;
   name: string;
   description?: string;
-  purpose: ApiKeyPurpose; // Purpose of the key: platform (for /admin/api/*) or inference (for /ai/*)
+  purpose: ApiKeyPurpose; // Purpose of the key; see ApiKeyPurpose for allowed values
   created_at: string; // ISO 8601 timestamp
   last_used?: string; // ISO 8601 timestamp
   requests_per_second?: number | null; // Rate limiting: requests per second
@@ -446,6 +478,7 @@ export interface GroupUpdateRequest {
 
 export interface ModelUpdateRequest {
   alias?: string;
+  display_name?: string | null;
   description?: string | null;
   model_type?: ModelType | null;
   capabilities?: string[] | null;
@@ -569,6 +602,7 @@ export interface AnalyticsEntry {
   duration_ms?: number;
   prompt_tokens?: number;
   completion_tokens?: number;
+  reasoning_tokens?: number;
   total_tokens?: number;
   response_type?: string;
   fusillade_batch_id?: string;
@@ -1009,6 +1043,16 @@ export interface FileObject {
     | "vision"
     | "user_data"
     | "evals";
+  /** Email of the individual who created this file */
+  created_by_email?: string;
+  /** "Personal" or org name */
+  context_name?: string;
+  /** "personal" or "organization" */
+  context_type?: string;
+  /** "sync" if ingested from an external connection */
+  source?: string;
+  /** Name of the source connection */
+  source_name?: string;
 }
 
 export interface FileListResponse {
@@ -1042,6 +1086,8 @@ export interface FilesListQuery {
   purpose?: string;
   search?: string;
   own?: boolean;
+  /** Filter by member user ID (for per-member filtering within orgs) */
+  member_id?: string;
 }
 
 export interface ModelCostBreakdown {
@@ -1129,6 +1175,21 @@ export interface Batch {
   usage?: BatchUsage;
   /** Included when requesting with include=analytics */
   analytics?: BatchAnalytics;
+  /** Doubleword-specific extensions (source provenance, etc.) */
+  dwext?: BatchDwExt;
+}
+
+export interface BatchDwExt {
+  /** How the batch was created: "api", "frontend", or "sync" */
+  source?: string;
+  /** Name of the source connection (when source = "sync") */
+  source_name?: string;
+  /** Source connection ID */
+  source_id?: string;
+  /** Original external file key */
+  source_file?: string;
+  /** Sync operation ID */
+  sync_id?: string;
 }
 
 export interface BatchListResponse {
@@ -1156,6 +1217,16 @@ export interface BatchesListQuery {
   search?: string;
   /** Comma-separated list of related resources to include. Supported: "analytics" */
   include?: string;
+  /** Filter by member user ID (for per-member filtering within orgs) */
+  member_id?: string;
+  /** Filter by batch status (e.g. "completed", "in_progress", "failed") */
+  status?: string;
+  /** Only return batches created after this ISO 8601 timestamp */
+  created_after?: string;
+  /** Only return batches created before this ISO 8601 timestamp */
+  created_before?: string;
+  /** When true, sort active (non-terminal) batches before terminal ones */
+  active_first?: boolean;
 }
 
 // ===== BATCH REQUESTS (Custom endpoints beyond OpenAI spec) =====
@@ -1233,6 +1304,7 @@ export interface BatchAnalytics {
   total_requests: number;
   total_prompt_tokens: number;
   total_completion_tokens: number;
+  total_reasoning_tokens?: number | null;
   total_tokens: number;
   avg_duration_ms?: number | null;
   avg_ttfb_ms?: number | null;
@@ -1285,7 +1357,9 @@ export interface DaemonConfig {
   backoff_ms: number;
   backoff_factor: number;
   max_backoff_ms: number;
-  timeout_ms: number;
+  first_chunk_timeout_ms: number;
+  chunk_timeout_ms: number;
+  body_timeout_ms: number;
   status_log_interval_ms?: number | null;
   heartbeat_interval_ms: number;
   claim_timeout_ms: number;
@@ -1315,6 +1389,8 @@ export interface DaemonsQuery {
 
 // ===== WEBHOOK TYPES =====
 
+export type WebhookScope = "own" | "platform";
+
 export interface Webhook {
   id: string;
   user_id: string;
@@ -1322,6 +1398,7 @@ export interface Webhook {
   enabled: boolean;
   event_types?: string[] | null;
   description?: string | null;
+  scope: WebhookScope;
   created_at: string;
   updated_at: string;
   disabled_at?: string | null;
@@ -1335,6 +1412,7 @@ export interface WebhookCreateRequest {
   url: string;
   event_types?: string[];
   description?: string;
+  scope?: WebhookScope;
 }
 
 export interface WebhookUpdateRequest {
@@ -1342,6 +1420,98 @@ export interface WebhookUpdateRequest {
   enabled?: boolean;
   event_types?: string[] | null;
   description?: string | null;
+}
+
+// ===== CONNECTION TYPES =====
+
+export interface Connection {
+  id: string;
+  kind: string;
+  provider: string;
+  name: string;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface ConnectionCreateRequest {
+  provider: string;
+  name: string;
+  config: Record<string, unknown>;
+  kind?: string;
+}
+
+export interface ConnectionTestResponse {
+  ok: boolean;
+  provider: string;
+  message?: string | null;
+  scope?: Record<string, unknown> | null;
+}
+
+export interface SyncOperation {
+  id: string;
+  connection_id: string;
+  status: string;
+  strategy: string;
+  files_found: number;
+  files_skipped: number;
+  files_ingested: number;
+  files_failed: number;
+  batches_created: number;
+  error_summary?: unknown | null;
+  started_at?: number | null;
+  completed_at?: number | null;
+  created_at: number;
+}
+
+export interface SyncEntry {
+  id: string;
+  external_key: string;
+  external_size_bytes?: number | null;
+  status: string;
+  file_id?: string | null;
+  batch_id?: string | null;
+  template_count?: number | null;
+  error?: string | null;
+  /** Lines that couldn't be parsed as JSON (garbled) */
+  skipped_lines?: number;
+  /** Per-line validation errors for parseable-but-invalid lines (capped at 1000) */
+  validation_errors?: Array<{
+    /** 0-based index into ingested templates (internal use) */
+    template_index: number;
+    /** 1-based source file line number */
+    line: number;
+    error: string;
+  }> | null;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface ExternalFileListResponse {
+  data: ExternalFile[];
+  has_more: boolean;
+  next_cursor?: string | null;
+}
+
+export interface ExternalFile {
+  key: string;
+  size_bytes?: number | null;
+  last_modified?: number | null;
+  display_name?: string | null;
+}
+
+export interface TriggerSyncRequest {
+  strategy?: string;
+  file_keys?: string[];
+  endpoint?: string;
+  completion_window?: string;
+  force?: boolean;
+}
+
+export interface SyncedKey {
+  key: string;
+  last_modified?: number | null;
+  /** "activated" or "failed" */
+  status: string;
 }
 
 // ===== ORGANIZATION TYPES =====
@@ -1378,6 +1548,8 @@ export interface OrganizationCreateRequest {
 export interface OrganizationUpdateRequest {
   display_name?: string;
   email?: string;
+  batch_notifications_enabled?: boolean;
+  low_balance_threshold?: number | null;
 }
 
 export interface InviteMemberRequest {

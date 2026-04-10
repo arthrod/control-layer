@@ -504,7 +504,9 @@ mod tests {
             metrics_recorder: None,
             is_leader: false,
             request_manager: state.request_manager,
+            task_runner: state.task_runner,
             limiters: state.limiters,
+            connections_encryption_key: None,
         };
 
         let request = axum::http::Request::builder()
@@ -610,7 +612,9 @@ mod tests {
             metrics_recorder: None,
             is_leader: false,
             request_manager: state.request_manager,
+            task_runner: state.task_runner,
             limiters: state.limiters,
+            connections_encryption_key: None,
         };
 
         let header_external_user_id = header_user.external_user_id.as_ref().unwrap_or(&header_user.username);
@@ -718,7 +722,9 @@ mod tests {
             metrics_recorder: None,
             is_leader: false,
             request_manager: state.request_manager,
+            task_runner: state.task_runner,
             limiters: state.limiters,
+            connections_encryption_key: None,
         };
 
         // Request with JWT cookie - should be ignored since native auth is disabled
@@ -893,7 +899,9 @@ mod tests {
             metrics_recorder: None,
             is_leader: false,
             request_manager: state.request_manager,
+            task_runner: state.task_runner,
             limiters: state.limiters,
+            connections_encryption_key: None,
         };
 
         let external_user_id = user.external_user_id.as_ref().unwrap_or(&user.username);
@@ -1001,7 +1009,9 @@ mod tests {
             metrics_recorder: None,
             is_leader: false,
             request_manager: state.request_manager,
+            task_runner: state.task_runner,
             limiters: state.limiters,
+            connections_encryption_key: None,
         };
 
         let request = axum::http::Request::builder()

@@ -17,11 +17,14 @@ use crate::auth::permissions::{RequiresPermission, can_read_all_resources, opera
 use crate::AppState;
 use crate::db::{
     handlers::api_keys::ApiKeys,
+    handlers::connections::Connections,
     handlers::deployments::{DeploymentFilter, Deployments},
     handlers::repository::Repository,
     handlers::tariffs::Tariffs,
+    handlers::users::Users,
     models::api_keys::ApiKeyPurpose,
     models::deployments::{ModelStatus, ModelType},
+    models::users::UserDBResponse,
 };
 use crate::errors::{Error, Result};
 use crate::types::Resource;
@@ -36,6 +39,7 @@ use chrono::Utc;
 use fusillade::Storage;
 use futures::StreamExt;
 use futures::stream::Stream;
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::pin::Pin;
@@ -391,22 +395,53 @@ type FileStreamResult = (
     Arc<Mutex<Option<FileUploadError>>>,
 );
 
-/// Helper function to create a stream of FileStreamItem from multipart upload
-/// This handles the entire multipart parsing inside the stream
-///
-/// # Arguments
-/// * `endpoint` - Target endpoint for batch requests (e.g., "http://localhost:8080/ai")
-/// * `api_key` - API key to inject for request execution
-#[tracing::instrument(skip(multipart, api_key, accessible_models), fields(config.max_file_size, config.max_requests_per_file, uploaded_by = ?uploaded_by, endpoint = %endpoint, config.buffer_size))]
-fn create_file_stream(
-    mut multipart: Multipart,
-    config: FileStreamConfig,
-    uploaded_by: Option<String>,
+fn resolve_upload_stream_result(
+    result: fusillade::FileStreamResult,
+    error_slot: &Arc<Mutex<Option<FileUploadError>>>,
+) -> Result<fusillade::FileId> {
+    match result {
+        fusillade::FileStreamResult::Success(file_id) => Ok(file_id),
+        fusillade::FileStreamResult::Aborted => {
+            let upload_err = match error_slot.lock() {
+                Ok(mut guard) => guard.take(),
+                Err(poisoned) => poisoned.into_inner().take(),
+            };
+            if let Some(upload_err) = upload_err {
+                tracing::warn!("File upload aborted with error: {:?}", upload_err);
+                return Err(upload_err.into_http_error());
+            }
+
+            Err(Error::Internal {
+                operation: "create file: fusillade returned Aborted without an upload error".to_string(),
+            })
+        }
+    }
+}
+
+/// Context for validating and routing requests parsed from file uploads.
+struct FileRequestContext {
     endpoint: String,
     api_key: String,
     accessible_models: HashMap<String, Option<ModelType>>,
     allowed_url_paths: Vec<String>,
+}
+
+/// Helper function to create a stream of FileStreamItem from multipart upload
+/// This handles the entire multipart parsing inside the stream
+#[tracing::instrument(skip(multipart, req_ctx), fields(config.max_file_size, config.max_requests_per_file, uploaded_by = ?uploaded_by, endpoint = %req_ctx.endpoint, config.buffer_size))]
+fn create_file_stream(
+    mut multipart: Multipart,
+    config: FileStreamConfig,
+    uploaded_by: Option<String>,
+    req_ctx: FileRequestContext,
+    api_key_id: Option<uuid::Uuid>,
 ) -> FileStreamResult {
+    let FileRequestContext {
+        endpoint,
+        api_key,
+        accessible_models,
+        allowed_url_paths,
+    } = req_ctx;
     let (tx, rx) = mpsc::channel(config.buffer_size);
     // std::sync::Mutex is appropriate here because:
     // 1. Lock is held only briefly (no await points while locked)
@@ -421,6 +456,7 @@ fn create_file_stream(
         let mut incomplete_utf8_bytes = Vec::with_capacity(4);
         let mut metadata = fusillade::FileMetadata {
             uploaded_by,
+            api_key_id,
             ..Default::default()
         };
         let mut file_processed = false;
@@ -433,7 +469,7 @@ fn create_file_stream(
                     Ok(mut guard) => *guard = Some($error),
                     Err(poisoned) => *poisoned.into_inner() = Some($error),
                 }
-                let _ = tx.send(fusillade::FileStreamItem::Error("aborted".to_string())).await;
+                let _ = tx.send(fusillade::FileStreamItem::Abort).await;
                 return;
             }};
         }
@@ -790,7 +826,8 @@ pub async fn upload_file<P: PoolProvider>(
         None
     };
 
-    let max_file_size = state.config.limits.files.max_file_size;
+    let config = state.current_config();
+    let max_file_size = config.limits.files.max_file_size;
 
     // Early rejection based on Content-Length header (if present)
     // This avoids streaming a large file only to reject it later.
@@ -815,26 +852,27 @@ pub async fn upload_file<P: PoolProvider>(
     })?;
 
     let stream_config = FileStreamConfig {
-        max_file_size: state.config.limits.files.max_file_size,
-        max_requests_per_file: state.config.limits.files.max_requests_per_file,
-        max_request_body_size: state.config.limits.requests.max_body_size,
-        buffer_size: state.config.batches.files.upload_buffer_size,
+        max_file_size: config.limits.files.max_file_size,
+        max_requests_per_file: config.limits.files.max_requests_per_file,
+        max_request_body_size: config.limits.requests.max_body_size,
+        buffer_size: config.batches.files.upload_buffer_size,
     };
-    // When in org context, attribute file ownership to the org (not the individual user)
+    // When in org context, attribute file ownership to the org (not the individual user).
+    // Also used for the hidden API key lookup below.
     let target_user_id = current_user.active_organization.unwrap_or(current_user.id);
     let uploaded_by = Some(target_user_id.to_string());
 
-    // Get or create user-specific hidden batch API key for batch request execution
-    let target_user_id = current_user.active_organization.unwrap_or(current_user.id);
+    // Get or create user-specific hidden batch API key for batch request execution.
+    // We need the key ID for per-member attribution within orgs.
     let mut conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
     let mut api_keys_repo = ApiKeys::new(&mut conn);
-    let user_api_key = api_keys_repo
-        .get_or_create_hidden_key(target_user_id, ApiKeyPurpose::Batch, current_user.id)
+    let (user_api_key, api_key_id) = api_keys_repo
+        .get_or_create_hidden_key_with_id(target_user_id, ApiKeyPurpose::Batch, current_user.id)
         .await
         .map_err(Error::Database)?;
 
     // Construct batch execution endpoint (where fusillade will send requests)
-    let endpoint = format!("http://{}:{}/ai", state.config.host, state.config.port);
+    let endpoint = format!("http://{}:{}/ai", config.host, config.port);
 
     // Query models accessible to the user for validation during file parsing
     let mut deployments_repo = Deployments::new(&mut conn);
@@ -854,14 +892,17 @@ pub async fn upload_file<P: PoolProvider>(
         multipart,
         stream_config,
         uploaded_by,
-        endpoint,
-        user_api_key,
-        accessible_models,
-        state.config.batches.allowed_url_paths.clone(),
+        FileRequestContext {
+            endpoint,
+            api_key: user_api_key,
+            accessible_models,
+            allowed_url_paths: config.batches.allowed_url_paths.clone(),
+        },
+        Some(api_key_id),
     );
 
     // Create file via request manager with streaming
-    let created_file_id = state.request_manager.create_file_stream(file_stream).await.map_err(|e| {
+    let created_file_result = state.request_manager.create_file_stream(file_stream).await.map_err(|e| {
         // Check if WE aborted (control-layer error in slot)
         // Handle poisoned mutex gracefully - the data is still valid
         let upload_err = match error_slot.lock() {
@@ -882,6 +923,8 @@ pub async fn upload_file<P: PoolProvider>(
             },
         }
     })?;
+
+    let created_file_id = resolve_upload_stream_result(created_file_result, &error_slot)?;
 
     tracing::debug!("File {} uploaded successfully", created_file_id);
 
@@ -922,6 +965,11 @@ pub async fn upload_file<P: PoolProvider>(
             filename: file.name,
             purpose: api_purpose,
             expires_at: file.expires_at.map(|dt| dt.timestamp()),
+            created_by_email: None,
+            context_name: None,
+            context_type: None,
+            source: file.source_connection_id.map(|_| "sync".to_string()),
+            source_name: None, // Upload response — no connection lookup needed
         }),
     ))
 }
@@ -965,13 +1013,73 @@ pub async fn list_files<P: PoolProvider>(
         .as_ref()
         .and_then(|id_str| uuid::Uuid::parse_str(id_str).ok().map(fusillade::FileId::from));
 
+    // Translate member_id (or own flag in org context) to api_key_ids for fusillade filtering.
+    // Uses a short-lived connection so we don't hold it across the fusillade call.
+    //
+    // Note: this only matches files created after hidden key attribution was deployed.
+    // Legacy files with api_key_id = NULL won't match the filter.
+    let api_key_ids_filter = if let Some(member_id) = query.member_id {
+        let mut read_conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
+        let key_ids = match current_user.active_organization {
+            Some(org_id) => {
+                let key_id = ApiKeys::new(&mut read_conn)
+                    .find_hidden_key_id(org_id, ApiKeyPurpose::Batch, member_id)
+                    .await
+                    .map_err(Error::Database)?;
+                key_id.into_iter().collect::<Vec<_>>()
+            }
+            None if can_read_all_files => ApiKeys::new(&mut read_conn)
+                .find_all_hidden_key_ids_by_creator(ApiKeyPurpose::Batch, member_id)
+                .await
+                .map_err(Error::Database)?,
+            None => {
+                return Err(Error::BadRequest {
+                    message: "member_id filter is only available in organization context or for platform managers".to_string(),
+                });
+            }
+        };
+        if key_ids.is_empty() {
+            return Ok(Json(FileListResponse {
+                object_type: ListObject::List,
+                data: vec![],
+                first_id: None,
+                last_id: None,
+                has_more: false,
+            }));
+        }
+        Some(key_ids)
+    } else if let Some(org_id) = current_user.active_organization.filter(|_| query.own) {
+        // own=true in org context: filter to files created by the current user's hidden key
+        let mut read_conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
+        let key_id = ApiKeys::new(&mut read_conn)
+            .find_hidden_key_id(org_id, ApiKeyPurpose::Batch, current_user.id)
+            .await
+            .map_err(Error::Database)?;
+        let key_ids: Vec<_> = key_id.into_iter().collect();
+        if key_ids.is_empty() {
+            return Ok(Json(FileListResponse {
+                object_type: ListObject::List,
+                data: vec![],
+                first_id: None,
+                last_id: None,
+                has_more: false,
+            }));
+        }
+        Some(key_ids)
+    } else {
+        None
+    };
+
     // Build filter based on permissions
     let filter = fusillade::FileFilter {
-        // Filter by ownership if user can't read all files, or if explicitly requested
-        // In org context, show files owned by the org instead of the individual user
-        uploaded_by: if !can_read_all_files || query.own {
-            let target_user_id = current_user.active_organization.unwrap_or(current_user.id);
-            Some(target_user_id.to_string())
+        // Ownership scoping:
+        // - Org context: always scope to org (unified view for both PMs and standard users)
+        // - Personal context + PM: no filter (sees all files), unless ?own=true
+        // - Personal context + standard user: scope to own files only
+        uploaded_by: if let Some(org_id) = current_user.active_organization {
+            Some(org_id.to_string())
+        } else if !can_read_all_files || query.own {
+            Some(current_user.id.to_string())
         } else {
             None
         },
@@ -981,10 +1089,10 @@ pub async fn list_files<P: PoolProvider>(
         search: query.search.clone(),
         after,
         limit: Some((limit + 1) as usize), // Fetch one extra to check has_more
+        api_key_ids: api_key_ids_filter,
         ascending: query.order == "asc",
     };
 
-    use fusillade::Storage;
     let mut files = state.request_manager.list_files(filter).await.map_err(|e| Error::Internal {
         operation: format!("list files: {}", e),
     })?;
@@ -998,6 +1106,67 @@ pub async fn list_files<P: PoolProvider>(
     let first_id = files.first().map(|f| f.id.0.to_string());
     let last_id = files.last().map(|f| f.id.0.to_string());
 
+    // Resolve creator/context metadata for all returned files.
+    // Uses a fresh connection (not held across the fusillade call above).
+    let mut read_conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
+
+    // Resolve individual creators via api_key_id → api_keys.created_by
+    let api_key_ids: Vec<uuid::Uuid> = files
+        .iter()
+        .filter_map(|f| f.api_key_id)
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+    let api_key_creator_map: std::collections::HashMap<uuid::Uuid, uuid::Uuid> = if !api_key_ids.is_empty() {
+        ApiKeys::new(&mut read_conn)
+            .get_creators_by_key_ids(api_key_ids)
+            .await
+            .map_err(Error::Database)?
+    } else {
+        std::collections::HashMap::new()
+    };
+
+    // Collect all unique user IDs: owners (uploaded_by) + individual creators
+    let mut all_user_ids: std::collections::HashSet<uuid::Uuid> = std::collections::HashSet::new();
+    for f in &files {
+        if let Some(owner_id) = f.uploaded_by.as_ref().and_then(|id| uuid::Uuid::parse_str(id).ok()) {
+            all_user_ids.insert(owner_id);
+        }
+        if let Some(api_key_id) = f.api_key_id
+            && let Some(&creator_id) = api_key_creator_map.get(&api_key_id)
+        {
+            all_user_ids.insert(creator_id);
+        }
+    }
+
+    // Bulk fetch all users for email + user_type + display_name
+    let user_map: std::collections::HashMap<uuid::Uuid, UserDBResponse> = if !all_user_ids.is_empty() {
+        Users::new(&mut read_conn)
+            .get_bulk(all_user_ids.into_iter().collect())
+            .await
+            .map_err(|e| Error::Internal {
+                operation: format!("fetch users: {}", e),
+            })?
+    } else {
+        std::collections::HashMap::new()
+    };
+
+    // Bulk fetch connection names for synced files
+    let source_conn_ids: Vec<uuid::Uuid> = files
+        .iter()
+        .filter_map(|f| f.source_connection_id)
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+    let connection_info: std::collections::HashMap<uuid::Uuid, (String, uuid::Uuid)> = if !source_conn_ids.is_empty() {
+        Connections::new(&mut read_conn)
+            .get_names_by_ids(&source_conn_ids)
+            .await
+            .map_err(Error::Database)?
+    } else {
+        std::collections::HashMap::new()
+    };
+
     let data: Vec<FileResponse> = files
         .iter()
         .map(|f| {
@@ -1009,14 +1178,37 @@ pub async fn list_files<P: PoolProvider>(
                 None => Purpose::Batch, // Default to Batch for backwards compatibility
             };
 
+            // Resolve individual creator email via api_key_id
+            let individual_creator_id = f.api_key_id.and_then(|key_id| api_key_creator_map.get(&key_id).copied());
+            let created_by_email = individual_creator_id.and_then(|uid| user_map.get(&uid)).map(|u| u.email.clone());
+
+            // Resolve context from file owner (uploaded_by field)
+            let owner_id = f.uploaded_by.as_ref().and_then(|id| uuid::Uuid::parse_str(id).ok());
+            let owner = owner_id.and_then(|id| user_map.get(&id));
+            let (context_name, context_type) = match owner {
+                Some(u) if u.user_type == "organization" => {
+                    let name = u.display_name.clone().unwrap_or_else(|| u.email.clone());
+                    (Some(name), Some("organization".to_string()))
+                }
+                Some(_) => (Some("Personal".to_string()), Some("personal".to_string())),
+                None => (None, None),
+            };
+
             FileResponse {
-                id: f.id.0.to_string(), // Use full UUID, not Display truncation
+                id: f.id.0.to_string(),
                 object_type: ObjectType::File,
                 bytes: f.size_bytes,
                 created_at: f.created_at.timestamp(),
                 filename: f.name.clone(),
                 purpose: api_purpose,
                 expires_at: f.expires_at.map(|dt| dt.timestamp()),
+                created_by_email,
+                context_name,
+                context_type,
+                source: f.source_connection_id.map(|_| "sync".to_string()),
+                source_name: f
+                    .source_connection_id
+                    .and_then(|id| connection_info.get(&id).map(|(name, _)| name.clone())),
             }
         })
         .collect();
@@ -1082,6 +1274,51 @@ pub async fn get_file<P: PoolProvider>(
         None => Purpose::Batch, // Default to Batch for backwards compatibility
     };
 
+    // Enrich with creator/context metadata (same as list_files)
+    let mut read_conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
+
+    // Resolve individual creator email via api_key_id
+    let created_by_email = if let Some(api_key_id) = file.api_key_id {
+        let creator_map = ApiKeys::new(&mut read_conn)
+            .get_creators_by_key_ids(vec![api_key_id])
+            .await
+            .map_err(Error::Database)?;
+        if let Some(&creator_id) = creator_map.get(&api_key_id) {
+            Users::new(&mut read_conn)
+                .get_bulk(vec![creator_id])
+                .await
+                .map_err(|e| Error::Internal {
+                    operation: format!("fetch creator user: {}", e),
+                })?
+                .get(&creator_id)
+                .map(|u| u.email.clone())
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    // Resolve context from file owner (uploaded_by field)
+    let (context_name, context_type) = if let Some(owner_id) = file.uploaded_by.as_ref().and_then(|id| Uuid::parse_str(id).ok()) {
+        let user_map = Users::new(&mut read_conn)
+            .get_bulk(vec![owner_id])
+            .await
+            .map_err(|e| Error::Internal {
+                operation: format!("fetch owner user: {}", e),
+            })?;
+        match user_map.get(&owner_id) {
+            Some(u) if u.user_type == "organization" => {
+                let name = u.display_name.clone().unwrap_or_else(|| u.email.clone());
+                (Some(name), Some("organization".to_string()))
+            }
+            Some(_) => (Some("Personal".to_string()), Some("personal".to_string())),
+            None => (None, None),
+        }
+    } else {
+        (None, None)
+    };
+
     Ok(Json(FileResponse {
         id: file.id.0.to_string(), // Use full UUID, not Display truncation
         object_type: ObjectType::File,
@@ -1090,6 +1327,22 @@ pub async fn get_file<P: PoolProvider>(
         filename: file.name,
         purpose: api_purpose,
         expires_at: file.expires_at.map(|dt| dt.timestamp()),
+        created_by_email,
+        context_name,
+        context_type,
+        source: file.source_connection_id.map(|_| "sync".to_string()),
+        source_name: if let Some(conn_id) = file.source_connection_id {
+            match Connections::new(&mut read_conn).get_by_id(conn_id).await {
+                Ok(Some(conn)) => Some(conn.name),
+                Ok(None) => None,
+                Err(e) => {
+                    tracing::warn!(error = %e, connection_id = %conn_id, "Failed to look up connection name for file");
+                    None
+                }
+            }
+        } else {
+            None
+        },
     }))
 }
 
@@ -1123,8 +1376,6 @@ pub async fn get_file_content<P: PoolProvider>(
     let file_id = Uuid::parse_str(&file_id_str).map_err(|_| Error::BadRequest {
         message: "Invalid file ID format".to_string(),
     })?;
-
-    use fusillade::Storage;
 
     // First, get the file to check ownership
     let file = state
@@ -1165,7 +1416,7 @@ pub async fn get_file_content<P: PoolProvider>(
                     .map_err(|e| Error::Internal {
                         operation: format!("get batch status: {}", e),
                     })?;
-                let still_processing = status.pending_requests > 0 || status.in_progress_requests > 0;
+                let still_processing = !status.is_finished();
                 (still_processing, Some(status.completed_requests as usize))
             } else {
                 (false, None)
@@ -1187,7 +1438,7 @@ pub async fn get_file_content<P: PoolProvider>(
                     .map_err(|e| Error::Internal {
                         operation: format!("get batch status: {}", e),
                     })?;
-                let still_processing = status.pending_requests > 0 || status.in_progress_requests > 0;
+                let still_processing = !status.is_finished();
                 (still_processing, Some(status.failed_requests as usize))
             } else {
                 (false, None)
@@ -1393,9 +1644,6 @@ pub async fn get_file_cost_estimate<P: PoolProvider>(
     Query(query): Query<FileCostEstimateQuery>,
     current_user: RequiresPermission<resource::Files, operation::ReadOwn>,
 ) -> Result<Json<crate::api::models::files::FileCostEstimate>> {
-    use rust_decimal::Decimal;
-    use std::collections::HashMap;
-
     let can_read_all_files = can_read_all_resources(&current_user, Resource::Files);
 
     let file_id = Uuid::parse_str(&file_id_str).map_err(|_| Error::BadRequest {
@@ -1582,6 +1830,7 @@ mod tests {
     use crate::db::models::api_keys::ApiKeyPurpose;
     use crate::test::utils::*;
     use sqlx::PgPool;
+    use std::sync::{Arc, Mutex};
     use uuid::Uuid;
 
     #[sqlx::test]
@@ -2573,13 +2822,28 @@ mod tests {
         let batch_id = batch["id"].as_str().expect("Should have id");
         let output_file_id = batch["output_file_id"].as_str().expect("Should have output_file_id");
 
-        // Manually complete all requests by updating their state in the database
         // Extract batch UUID from "batch_xxx" format
         let batch_uuid = batch_id.strip_prefix("batch_").unwrap_or(batch_id);
         let batch_uuid = Uuid::parse_str(batch_uuid).expect("Valid batch UUID");
 
-        // Use unchecked query since fusillade schema is created at runtime
-        // Must set completed_at to satisfy the completed_fields_check constraint
+        // Wait for the underway worker to populate the batch with requests
+        for attempt in 0..200 {
+            let count = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM fusillade.requests WHERE batch_id = $1")
+                .bind(batch_uuid)
+                .fetch_one(&pool)
+                .await
+                .expect("Failed to count requests");
+            if count > 0 {
+                break;
+            }
+            assert!(
+                attempt < 199,
+                "Timed out waiting for requests to be populated for batch {batch_uuid}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        // Manually complete all requests
         sqlx::query(
             r#"
             UPDATE fusillade.requests
@@ -2833,10 +3097,23 @@ mod tests {
         let batch_id_str = batch["id"].as_str().expect("Should have id");
         let output_file_id = batch["output_file_id"].as_str().expect("Should have output_file_id");
 
-        // Complete all requests so the output file has content
         let batch_uuid_str = batch_id_str.strip_prefix("batch_").unwrap_or(batch_id_str);
         let batch_uuid = Uuid::parse_str(batch_uuid_str).expect("Valid batch UUID");
 
+        // Wait for the underway worker to populate requests
+        loop {
+            let count = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM fusillade.requests WHERE batch_id = $1")
+                .bind(batch_uuid)
+                .fetch_one(&pool)
+                .await
+                .expect("Failed to count requests");
+            if count > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        // Complete all requests so the output file has content
         sqlx::query(
             r#"
             UPDATE fusillade.requests
@@ -3040,6 +3317,43 @@ mod tests {
                 assert!(message.contains("custom_id too long"));
             }
             _ => panic!("Expected BadRequest error"),
+        }
+    }
+
+    #[test]
+    fn test_resolve_upload_stream_result_aborted_maps_error_slot_to_http_error() {
+        let error_slot = Arc::new(Mutex::new(Some(super::FileUploadError::InvalidJson {
+            line: 7,
+            error: "expected value".to_string(),
+        })));
+
+        let err = super::resolve_upload_stream_result(fusillade::FileStreamResult::Aborted, &error_slot)
+            .expect_err("aborted stream should map to an HTTP error");
+
+        match err {
+            crate::errors::Error::BadRequest { message } => {
+                assert!(message.contains("line 7"));
+                assert!(message.contains("expected value"));
+            }
+            other => panic!("Expected BadRequest error, got {other:?}"),
+        }
+
+        let slot = error_slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(slot.is_none(), "error slot should be consumed");
+    }
+
+    #[test]
+    fn test_resolve_upload_stream_result_aborted_without_error_slot_is_internal() {
+        let error_slot = Arc::new(Mutex::new(None));
+
+        let err = super::resolve_upload_stream_result(fusillade::FileStreamResult::Aborted, &error_slot)
+            .expect_err("aborted stream without a control-layer error should be internal");
+
+        match err {
+            crate::errors::Error::Internal { operation } => {
+                assert!(operation.contains("fusillade returned Aborted without an upload error"));
+            }
+            other => panic!("Expected Internal error, got {other:?}"),
         }
     }
 
@@ -3416,5 +3730,97 @@ mod tests {
             .await;
 
         upload_response.assert_status(axum::http::StatusCode::CREATED);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_list_files_member_id_rejected_outside_org_context(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let auth = add_auth_headers(&user);
+
+        // Attempt member_id filter without org context → should return 400
+        let resp = app
+            .get(&format!("/ai/v1/files?member_id={}", Uuid::new_v4()))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await;
+        resp.assert_status(axum::http::StatusCode::BAD_REQUEST);
+        let body = resp.text();
+        assert!(
+            body.contains("organization context"),
+            "Expected error about org context, got: {}",
+            body
+        );
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_list_files_member_id_no_key_returns_empty(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let org = create_test_org(&pool, user.id).await;
+        let auth = add_auth_headers(&user);
+        let org_cookie = format!("dw_active_org={}", org.id);
+
+        // Filter by a member who has never uploaded files → empty list
+        let resp = app
+            .get(&format!("/ai/v1/files?member_id={}", Uuid::new_v4()))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .add_header("cookie", &org_cookie)
+            .await;
+        resp.assert_status_ok();
+        let body: serde_json::Value = resp.json();
+        assert_eq!(body["data"].as_array().unwrap().len(), 0);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_list_files_enrichment_in_personal_context(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+        let deployment = create_test_deployment(&pool, user.id, "gpt-4-model", "gpt-4").await;
+        add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
+        let auth = add_auth_headers(&user);
+
+        // Upload a file in personal context
+        let jsonl_content = r#"{"custom_id":"req-1","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}}"#;
+        let file_part = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("personal-test.jsonl");
+        let multipart = axum_test::multipart::MultipartForm::new()
+            .add_part("file", file_part)
+            .add_part("purpose", axum_test::multipart::Part::text("batch"));
+        let upload_resp = app
+            .post("/ai/v1/files")
+            .multipart(multipart)
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await;
+        upload_resp.assert_status(axum::http::StatusCode::CREATED);
+
+        // List in personal context → enrichment fields should be present
+        // (enrichment is always applied since authorization already controls visibility)
+        let list_resp = app
+            .get("/ai/v1/files")
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await;
+        list_resp.assert_status_ok();
+        let body: serde_json::Value = list_resp.json();
+        let files = body["data"].as_array().unwrap();
+        assert!(!files.is_empty(), "Expected at least one personal file");
+        for file in files {
+            assert!(
+                file.get("context_name").is_some() && !file["context_name"].is_null(),
+                "context_name should be present even in personal context"
+            );
+            assert_eq!(
+                file["context_type"].as_str(),
+                Some("personal"),
+                "personal file should have context_type=personal"
+            );
+        }
     }
 }
