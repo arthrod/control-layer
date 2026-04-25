@@ -3,7 +3,7 @@ export const queryKeys = {
   // Users
   users: {
     all: ["users"] as const,
-    query: (options?: { include?: string; skip?: number; limit?: number }) =>
+    query: (options?: { include?: string; skip?: number; limit?: number; search?: string }) =>
       ["users", "query", options] as const,
     byId: (id: string, include?: string) =>
       ["users", "byId", id, include] as const,
@@ -35,6 +35,13 @@ export const queryKeys = {
       is_composite?: boolean;
       group?: string;
     }) => ["models", "metrics", options] as const,
+  },
+
+  providerDisplayConfigs: {
+    all: ["providerDisplayConfigs"] as const,
+    query: () => ["providerDisplayConfigs", "query"] as const,
+    byKey: (providerKey: string) =>
+      ["providerDisplayConfigs", "byKey", providerKey] as const,
   },
 
   // Groups
@@ -151,5 +158,18 @@ export const queryKeys = {
     byId: (id: string) => ["organizations", "byId", id] as const,
     members: (orgId: string) =>
       ["organizations", "members", orgId] as const,
+  },
+
+  // Connections
+  connections: {
+    all: ["connections"] as const,
+    list: (kind?: string) => ["connections", "list", kind] as const,
+    byId: (id: string) => ["connections", "byId", id] as const,
+    syncs: (connectionId: string) => ["connections", connectionId, "syncs"] as const,
+    sync: (connectionId: string, syncId: string) => ["connections", connectionId, "syncs", syncId] as const,
+    syncEntries: (connectionId: string, syncId: string) =>
+      ["connections", connectionId, "syncs", syncId, "entries"] as const,
+    files: (connectionId: string, options?: { search?: string; cursor?: string; limit?: number }) =>
+      ["connections", connectionId, "files", options] as const,
   },
 } as const;

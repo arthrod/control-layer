@@ -78,6 +78,17 @@ import type {
   UpdateMemberRoleRequest,
   SetActiveOrganizationResponse,
   ModelListResponse,
+  Connection,
+  ConnectionCreateRequest,
+  ConnectionTestResponse,
+  SyncOperation,
+  SyncEntry,
+  TriggerSyncRequest,
+  ExternalFileListResponse,
+  SyncedKey,
+  ProviderDisplayConfig,
+  ProviderDisplayConfigCreateRequest,
+  ProviderDisplayConfigUpdateRequest,
 } from "./types";
 import { ApiError } from "./errors";
 
@@ -476,6 +487,66 @@ const modelApi = {
         throw new Error(`Failed to remove component: ${response.status}`);
       }
     },
+  },
+};
+
+const providerDisplayConfigApi = {
+  async list(): Promise<ProviderDisplayConfig[]> {
+    const response = await fetch("/admin/api/v1/provider-display-configs");
+    if (!response.ok) {
+      throw new Error(`Failed to fetch provider display configs: ${response.status}`);
+    }
+    return response.json();
+  },
+
+  async create(data: ProviderDisplayConfigCreateRequest): Promise<ProviderDisplayConfig> {
+    const response = await fetch("/admin/api/v1/provider-display-configs", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(data),
+    });
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new ApiError(
+        response.status,
+        errorText || `Failed to create provider display config: ${response.status}`,
+      );
+    }
+    return response.json();
+  },
+
+  async update(
+    providerKey: string,
+    data: ProviderDisplayConfigUpdateRequest,
+  ): Promise<ProviderDisplayConfig> {
+    const response = await fetch(
+      `/admin/api/v1/provider-display-configs/${encodeURIComponent(providerKey)}`,
+      {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(data),
+      },
+    );
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new ApiError(
+        response.status,
+        errorText || `Failed to update provider display config: ${response.status}`,
+      );
+    }
+    return response.json();
+  },
+
+  async delete(providerKey: string): Promise<void> {
+    const response = await fetch(
+      `/admin/api/v1/provider-display-configs/${encodeURIComponent(providerKey)}`,
+      {
+        method: "DELETE",
+      },
+    );
+    if (!response.ok) {
+      throw new Error(`Failed to delete provider display config: ${response.status}`);
+    }
   },
 };
 
@@ -1141,6 +1212,20 @@ const paymentsApi = {
     return response.json();
   },
 
+  async disableAutoTopup(): Promise<void> {
+    const response = await fetch("/admin/api/v1/auto-topup/disable", {
+      method: "POST",
+    });
+
+    if (!response.ok) {
+      const errorData = await response.json().catch(() => ({}));
+      throw new Error(
+        errorData.message ||
+          `Failed to disable auto top-up: ${response.status}`,
+      );
+    }
+  },
+
 };
 
 // Probes API
@@ -1309,6 +1394,7 @@ const filesApi = {
     if (options?.purpose) params.set("purpose", options.purpose);
     if (options?.search) params.set("search", options.search);
     if (options?.own) params.set("own", "true");
+    if (options?.member_id) params.set("member_id", options.member_id);
 
     const response = await fetchAiApi(
       `/ai/v1/files${params.toString() ? "?" + params.toString() : ""}`,
@@ -1468,6 +1554,13 @@ const batchesApi = {
     if (options?.limit) params.set("limit", options.limit.toString());
     if (options?.search) params.set("search", options.search);
     if (options?.include) params.set("include", options.include);
+    if (options?.member_id) params.set("member_id", options.member_id);
+    if (options?.status) params.set("status", options.status);
+    if (options?.created_after) params.set("created_after", options.created_after);
+    if (options?.created_before) params.set("created_before", options.created_before);
+    if (options?.active_first) params.set("active_first", "true");
+    if (options?.exclude_completion_window)
+      params.set("exclude_completion_window", options.exclude_completion_window);
 
     const response = await fetchAiApi(
       `/ai/v1/batches${params.toString() ? "?" + params.toString() : ""}`,
@@ -1849,6 +1942,22 @@ const organizationsApi = {
     }
   },
 
+  async leave(orgId: string): Promise<void> {
+    const response = await fetch(
+      `/admin/api/v1/organizations/${orgId}/leave`,
+      {
+        method: "POST",
+      },
+    );
+    if (!response.ok) {
+      const error = await response.text();
+      throw new ApiError(
+        response.status,
+        `Failed to leave organization: ${error}`,
+      );
+    }
+  },
+
   async setActive(
     organizationId: string | null,
   ): Promise<SetActiveOrganizationResponse> {
@@ -1868,10 +1977,187 @@ const organizationsApi = {
   },
 };
 
+const supportApi = {
+  async submitRequest(data: {
+    subject: string;
+    message: string;
+  }): Promise<{ sent: boolean }> {
+    const response = await fetch("/admin/api/v1/support/requests", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(data),
+    });
+    if (!response.ok) {
+      const error = await response.text();
+      throw new ApiError(
+        response.status,
+        `Failed to submit support request: ${error}`,
+      );
+    }
+    return response.json();
+  },
+};
+
+const connectionsApi = {
+  async list(kind?: string): Promise<{ data: Connection[] }> {
+    const params = kind ? `?kind=${kind}` : "";
+    const response = await fetch(`/admin/api/v1/connections${params}`);
+    if (!response.ok) {
+      throw new ApiError(response.status, "Failed to fetch connections");
+    }
+    return response.json();
+  },
+
+  async get(connectionId: string): Promise<Connection> {
+    const response = await fetch(`/admin/api/v1/connections/${connectionId}`);
+    if (!response.ok) {
+      throw new ApiError(response.status, "Failed to fetch connection");
+    }
+    return response.json();
+  },
+
+  async create(data: ConnectionCreateRequest): Promise<Connection> {
+    const response = await fetch("/admin/api/v1/connections", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(data),
+    });
+    if (!response.ok) {
+      const error = await response.text();
+      throw new ApiError(response.status, `Failed to create connection: ${error}`);
+    }
+    return response.json();
+  },
+
+  async delete(connectionId: string): Promise<void> {
+    const response = await fetch(`/admin/api/v1/connections/${connectionId}`, {
+      method: "DELETE",
+    });
+    if (!response.ok) {
+      throw new ApiError(response.status, "Failed to delete connection");
+    }
+  },
+
+  async test(connectionId: string): Promise<ConnectionTestResponse> {
+    const response = await fetch(`/admin/api/v1/connections/${connectionId}/test`, {
+      method: "POST",
+    });
+    if (!response.ok) {
+      throw new ApiError(response.status, "Failed to test connection");
+    }
+    return response.json();
+  },
+
+  async triggerSync(connectionId: string, data: TriggerSyncRequest): Promise<SyncOperation> {
+    const response = await fetch(`/admin/api/v1/connections/${connectionId}/sync`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(data),
+    });
+    if (!response.ok) {
+      const error = await response.text();
+      throw new ApiError(response.status, `Failed to trigger sync: ${error}`);
+    }
+    return response.json();
+  },
+
+  async listSyncs(connectionId: string): Promise<{ data: SyncOperation[] }> {
+    const response = await fetch(`/admin/api/v1/connections/${connectionId}/syncs`);
+    if (!response.ok) {
+      throw new ApiError(response.status, "Failed to fetch syncs");
+    }
+    return response.json();
+  },
+
+  async getSync(connectionId: string, syncId: string): Promise<SyncOperation> {
+    const response = await fetch(`/admin/api/v1/connections/${connectionId}/syncs/${syncId}`);
+    if (!response.ok) {
+      throw new ApiError(response.status, "Failed to fetch sync");
+    }
+    return response.json();
+  },
+
+  async listSyncEntries(connectionId: string, syncId: string): Promise<{ data: SyncEntry[] }> {
+    const response = await fetch(`/admin/api/v1/connections/${connectionId}/syncs/${syncId}/entries`);
+    if (!response.ok) {
+      throw new ApiError(response.status, "Failed to fetch sync entries");
+    }
+    return response.json();
+  },
+
+  async listSyncedKeys(connectionId: string): Promise<SyncedKey[]> {
+    const response = await fetch(`/admin/api/v1/connections/${connectionId}/synced-keys`);
+    if (!response.ok) {
+      throw new ApiError(response.status, "Failed to fetch synced keys");
+    }
+    return response.json();
+  },
+
+  async listFiles(
+    connectionId: string,
+    options?: { limit?: number; cursor?: string; search?: string },
+  ): Promise<ExternalFileListResponse> {
+    const params = new URLSearchParams();
+    if (options?.limit) params.set("limit", String(options.limit));
+    if (options?.cursor) params.set("cursor", options.cursor);
+    if (options?.search) params.set("search", options.search);
+    const qs = params.toString() ? `?${params.toString()}` : "";
+    const response = await fetch(`/admin/api/v1/connections/${connectionId}/files${qs}`);
+    if (!response.ok) {
+      throw new ApiError(response.status, "Failed to fetch files");
+    }
+    return response.json();
+  },
+};
+
+const asyncRequestsApi = {
+  async list(
+    options?: import("./types").AsyncRequestsListQuery,
+  ): Promise<import("./types").PaginatedResponse<import("./types").AsyncRequest>> {
+    const params = new URLSearchParams();
+    if (options?.skip) params.set("skip", options.skip.toString());
+    if (options?.limit) params.set("limit", options.limit.toString());
+    if (options?.completion_window)
+      params.set("completion_window", options.completion_window);
+    if (options?.service_tiers)
+      params.set("service_tiers", options.service_tiers);
+    if (options?.status) params.set("status", options.status);
+    if (options?.model) params.set("model", options.model);
+    if (options?.member_id) params.set("member_id", options.member_id);
+    if (options?.created_after)
+      params.set("created_after", options.created_after);
+    if (options?.created_before)
+      params.set("created_before", options.created_before);
+    if (options?.active_first !== undefined)
+      params.set("active_first", options.active_first.toString());
+
+    const response = await fetch(
+      `/admin/api/v1/batches/requests${params.toString() ? "?" + params.toString() : ""}`,
+    );
+    if (!response.ok) {
+      throw new Error(`Failed to fetch batch requests: ${response.status}`);
+    }
+    return response.json();
+  },
+
+  async get(
+    id: string,
+  ): Promise<import("./types").AsyncRequestDetail> {
+    const response = await fetch(
+      `/admin/api/v1/batches/requests/${id}`,
+    );
+    if (!response.ok) {
+      throw new Error(`Failed to fetch batch request: ${response.status}`);
+    }
+    return response.json();
+  },
+};
+
 // Main nested API object
 export const dwctlApi = {
   users: userApi,
   models: modelApi,
+  providerDisplayConfigs: providerDisplayConfigApi,
   endpoints: endpointApi,
   groups: groupApi,
   config: configApi,
@@ -1886,4 +2172,7 @@ export const dwctlApi = {
   daemons: daemonsApi,
   usage: usageApi,
   organizations: organizationsApi,
+  support: supportApi,
+  connections: connectionsApi,
+  asyncRequests: asyncRequestsApi,
 };

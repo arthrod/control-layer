@@ -46,6 +46,10 @@ import type {
   OrganizationUpdateRequest,
   InviteMemberRequest,
   OrgMemberRole,
+  ConnectionCreateRequest,
+  TriggerSyncRequest,
+  ProviderDisplayConfigCreateRequest,
+  ProviderDisplayConfigUpdateRequest,
 } from "./types";
 
 // Config hooks
@@ -76,6 +80,7 @@ export function useUsers(options?: UsersQuery & { enabled?: boolean }) {
     enabled,
   });
 }
+
 
 export function useUser(id: string, options?: { include?: string }) {
   return useQuery({
@@ -246,6 +251,61 @@ export function useCreateModel() {
         queryKeys.models.byId(createdModel.id),
         createdModel,
       );
+    },
+  });
+}
+
+export function useProviderDisplayConfigs(options?: { enabled?: boolean }) {
+  const { enabled = true } = options || {};
+  return useQuery({
+    queryKey: queryKeys.providerDisplayConfigs.query(),
+    queryFn: () => dwctlApi.providerDisplayConfigs.list(),
+    enabled,
+  });
+}
+
+export function useCreateProviderDisplayConfig() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (data: ProviderDisplayConfigCreateRequest) =>
+      dwctlApi.providerDisplayConfigs.create(data),
+    onSuccess: (config) => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.providerDisplayConfigs.all });
+      queryClient.setQueryData(
+        queryKeys.providerDisplayConfigs.byKey(config.provider_key),
+        config,
+      );
+    },
+  });
+}
+
+export function useUpdateProviderDisplayConfig() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({
+      providerKey,
+      data,
+    }: {
+      providerKey: string;
+      data: ProviderDisplayConfigUpdateRequest;
+    }) => dwctlApi.providerDisplayConfigs.update(providerKey, data),
+    onSuccess: (config) => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.providerDisplayConfigs.all });
+      queryClient.setQueryData(
+        queryKeys.providerDisplayConfigs.byKey(config.provider_key),
+        config,
+      );
+    },
+  });
+}
+
+export function useDeleteProviderDisplayConfig() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (providerKey: string) => dwctlApi.providerDisplayConfigs.delete(providerKey),
+    onSuccess: (_, providerKey) => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.providerDisplayConfigs.all });
+      queryClient.removeQueries({ queryKey: queryKeys.providerDisplayConfigs.byKey(providerKey) });
     },
   });
 }
@@ -599,11 +659,14 @@ export function useDeleteApiKey() {
       userId?: string;
     }) => dwctlApi.users.apiKeys.delete(keyId, userId),
     onSuccess: (_, { keyId, userId = "current" }) => {
-      queryClient.invalidateQueries({
-        queryKey: queryKeys.apiKeys.query(userId),
-      });
+      const apiKeysQueryPrefix = ["apiKeys", "query", userId] as const;
+
       queryClient.removeQueries({
         queryKey: queryKeys.apiKeys.byId(keyId, userId),
+      });
+      queryClient.invalidateQueries({
+        queryKey: apiKeysQueryPrefix,
+        refetchType: "active",
       });
     },
   });
@@ -1071,7 +1134,7 @@ export function useBatchAnalytics(id: string) {
 }
 
 // Deprecated: Batch request viewing disabled - would need to fetch/merge output and error files
-// export function useBatchRequests(
+// export function useAsyncRequests(
 //   id: string,
 //   options?: BatchRequestsListQuery,
 // ) {
@@ -1305,6 +1368,18 @@ export function useEnableAutoTopup() {
     mutationKey: ["payments", "auto-topup-enable"],
     mutationFn: ({ threshold, amount, monthlyLimit }: { threshold: number; amount: number; monthlyLimit: number | null }) =>
       dwctlApi.payments.enableAutoTopup(threshold, amount, monthlyLimit),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.users.all });
+    },
+  });
+}
+
+export function useDisableAutoTopup() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationKey: ["payments", "auto-topup-disable"],
+    mutationFn: () => dwctlApi.payments.disableAutoTopup(),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: queryKeys.users.all });
     },
@@ -1609,6 +1684,217 @@ export function useRemoveMember() {
       queryClient.invalidateQueries({
         queryKey: queryKeys.organizations.byId(variables.orgId),
       });
+    },
+  });
+}
+
+export function useLeaveOrganization() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationKey: ["organizations", "leave"],
+    mutationFn: (orgId: string) => dwctlApi.organizations.leave(orgId),
+    onSettled: () => {
+      queryClient.invalidateQueries({
+        queryKey: queryKeys.organizations.all,
+      });
+      queryClient.invalidateQueries({
+        queryKey: queryKeys.users.byId("current"),
+      });
+    },
+  });
+}
+
+// Support
+export function useSubmitSupportRequest() {
+  return useMutation({
+    mutationKey: ["support", "submit"],
+    mutationFn: (data: { subject: string; message: string }) =>
+      dwctlApi.support.submitRequest(data),
+  });
+}
+
+// ===== CONNECTION HOOKS =====
+
+export function useConnections(kind?: string) {
+  return useQuery({
+    queryKey: queryKeys.connections.list(kind),
+    queryFn: () => dwctlApi.connections.list(kind),
+    select: (data) => data.data,
+  });
+}
+
+export function useCreateConnection() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationKey: ["connections", "create"],
+    mutationFn: (data: ConnectionCreateRequest) =>
+      dwctlApi.connections.create(data),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.connections.all });
+    },
+  });
+}
+
+export function useDeleteConnection() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationKey: ["connections", "delete"],
+    mutationFn: (connectionId: string) =>
+      dwctlApi.connections.delete(connectionId),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.connections.all });
+    },
+  });
+}
+
+export function useTestConnection() {
+  return useMutation({
+    mutationKey: ["connections", "test"],
+    mutationFn: (connectionId: string) =>
+      dwctlApi.connections.test(connectionId),
+  });
+}
+
+export function useTriggerSync() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationKey: ["connections", "sync"],
+    mutationFn: ({
+      connectionId,
+      data,
+    }: {
+      connectionId: string;
+      data: TriggerSyncRequest;
+    }) => dwctlApi.connections.triggerSync(connectionId, data),
+    onSuccess: (_data, variables) => {
+      queryClient.invalidateQueries({
+        queryKey: queryKeys.connections.syncs(variables.connectionId),
+      });
+      // Invalidate synced-keys so file browser refreshes status
+      queryClient.invalidateQueries({
+        queryKey: [...queryKeys.connections.all, variables.connectionId, "synced-keys"],
+      });
+    },
+  });
+}
+
+export function useSyncs(connectionId: string) {
+  return useQuery({
+    queryKey: queryKeys.connections.syncs(connectionId),
+    queryFn: () => dwctlApi.connections.listSyncs(connectionId),
+    select: (data) => data.data,
+    enabled: !!connectionId,
+  });
+}
+
+export function useSync(connectionId: string, syncId: string) {
+  return useQuery({
+    queryKey: queryKeys.connections.sync(connectionId, syncId),
+    queryFn: () => dwctlApi.connections.getSync(connectionId, syncId),
+    enabled: !!connectionId && !!syncId,
+    refetchInterval: (query) => {
+      const status = query.state.data?.status;
+      // Poll while sync is in progress
+      if (status && !["completed", "failed", "cancelled"].includes(status)) {
+        return 2000;
+      }
+      return false;
+    },
+  });
+}
+
+export function useSyncEntries(connectionId: string, syncId: string) {
+  return useQuery({
+    queryKey: queryKeys.connections.syncEntries(connectionId, syncId),
+    queryFn: () => dwctlApi.connections.listSyncEntries(connectionId, syncId),
+    enabled: !!connectionId && !!syncId,
+    refetchInterval: (query) => {
+      const entries = query.state.data?.data;
+      if (!entries) return 2000;
+      if (entries.some((e: { status: string }) => !["activated", "failed", "skipped"].includes(e.status))) {
+        return 2000;
+      }
+      return false;
+    },
+  });
+}
+
+export function useSyncedKeys(connectionId: string) {
+  return useQuery({
+    queryKey: [...queryKeys.connections.all, connectionId, "synced-keys"],
+    queryFn: () => dwctlApi.connections.listSyncedKeys(connectionId),
+    enabled: !!connectionId,
+    staleTime: 0, // Always refetch on mount (e.g. navigating back to the page)
+  });
+}
+
+export function useConnectionFiles(
+  connectionId: string,
+  options?: { search?: string; cursor?: string; limit?: number },
+) {
+  return useQuery({
+    queryKey: queryKeys.connections.files(connectionId, {
+      search: options?.search,
+      cursor: options?.cursor,
+      limit: options?.limit,
+    }),
+    queryFn: () => dwctlApi.connections.listFiles(connectionId, options),
+    enabled: !!connectionId,
+    staleTime: 0, // Always refetch on mount
+    placeholderData: keepPreviousData,
+  });
+}
+
+// === Batch Requests (individual requests within batches) ===
+
+export function useAsyncRequests(
+  options?: import("./types").AsyncRequestsListQuery & { enabled?: boolean },
+) {
+  const { enabled, ...queryOptions } = options || {};
+
+  return useQuery({
+    queryKey: ["asyncRequests", queryOptions],
+    queryFn: () => dwctlApi.asyncRequests.list(queryOptions),
+    enabled,
+    refetchOnMount: "always" as const,
+    refetchInterval: (query: {
+      state: {
+        data?: import("./types").PaginatedResponse<
+          import("./types").AsyncRequest
+        >;
+      };
+    }) => {
+      const requests = query.state.data?.data;
+      if (
+        requests?.some((r: import("./types").AsyncRequest) =>
+          ["pending", "claimed", "processing"].includes(r.status),
+        )
+      ) {
+        return 2000;
+      }
+      return false;
+    },
+  });
+}
+
+export function useAsyncRequest(id: string | undefined) {
+  return useQuery({
+    queryKey: ["asyncRequests", "detail", id],
+    queryFn: () => dwctlApi.asyncRequests.get(id!),
+    enabled: !!id,
+    refetchOnMount: "always" as const,
+    refetchInterval: (query: {
+      state: { data?: import("./types").AsyncRequestDetail };
+    }) => {
+      const request = query.state.data;
+      if (
+        request &&
+        ["pending", "claimed", "processing"].includes(request.status)
+      ) {
+        return 2000;
+      }
+      return false;
     },
   });
 }

@@ -36,14 +36,43 @@ pub async fn create_test_app_state_with_config(pool: PgPool, config: crate::conf
         .await
         .expect("Failed to create fusillade TestDbPools");
 
-    let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(fusillade_pools));
+    let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(fusillade_pools, Default::default()));
     let limiters = crate::limits::Limiters::new(&config.limits);
+    let shared_config = crate::SharedConfig::new(config);
 
+    underway::run_migrations(&pool).await.expect("Failed to run underway migrations");
+    let task_state = crate::tasks::TaskState {
+        request_manager: request_manager.clone(),
+        dwctl_pool: pool.clone(),
+        config: shared_config.clone(),
+        encryption_key: None,
+        ingest_file_job: std::sync::Arc::new(std::sync::OnceLock::new()),
+        activate_batch_job: std::sync::Arc::new(std::sync::OnceLock::new()),
+        create_batch_job: std::sync::Arc::new(std::sync::OnceLock::new()),
+        cascade_batch_state_job: std::sync::Arc::new(std::sync::OnceLock::new()),
+    };
+    let task_runner = std::sync::Arc::new(
+        crate::tasks::TaskRunner::new(
+            pool,
+            task_state,
+            &crate::config::TaskWorkersConfig {
+                create_batch_workers: 0,
+                cascade_batch_state_workers: 0,
+                response_workers: 0,
+            },
+        )
+        .await
+        .expect("Failed to create task runner"),
+    );
+
+    let response_store = std::sync::Arc::new(crate::responses::store::FusilladeResponseStore::new(request_manager.clone()));
     crate::AppState::builder()
         .db(test_pools)
-        .config(config.clone())
+        .config(shared_config)
         .request_manager(request_manager)
+        .task_runner(task_runner)
         .limiters(limiters)
+        .response_store(response_store)
         .build()
 }
 
@@ -74,14 +103,43 @@ pub async fn create_test_app_state_with_fusillade(pool: PgPool, config: crate::c
     let fusillade_test_pools = TestDbPools::new(fusillade_pool)
         .await
         .expect("Failed to create fusillade TestDbPools");
-    let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(fusillade_test_pools));
+    let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(fusillade_test_pools, Default::default()));
     let limiters = crate::limits::Limiters::new(&config.limits);
+    let shared_config = crate::SharedConfig::new(config);
 
+    underway::run_migrations(&pool).await.expect("Failed to run underway migrations");
+    let task_state = crate::tasks::TaskState {
+        request_manager: request_manager.clone(),
+        dwctl_pool: pool.clone(),
+        config: shared_config.clone(),
+        encryption_key: None,
+        ingest_file_job: std::sync::Arc::new(std::sync::OnceLock::new()),
+        activate_batch_job: std::sync::Arc::new(std::sync::OnceLock::new()),
+        create_batch_job: std::sync::Arc::new(std::sync::OnceLock::new()),
+        cascade_batch_state_job: std::sync::Arc::new(std::sync::OnceLock::new()),
+    };
+    let task_runner = std::sync::Arc::new(
+        crate::tasks::TaskRunner::new(
+            pool,
+            task_state,
+            &crate::config::TaskWorkersConfig {
+                create_batch_workers: 0,
+                cascade_batch_state_workers: 0,
+                response_workers: 0,
+            },
+        )
+        .await
+        .expect("Failed to create task runner"),
+    );
+
+    let response_store = std::sync::Arc::new(crate::responses::store::FusilladeResponseStore::new(request_manager.clone()));
     crate::AppState::builder()
         .db(test_pools)
-        .config(config)
+        .config(shared_config)
         .request_manager(request_manager)
+        .task_runner(task_runner)
         .limiters(limiters)
+        .response_store(response_store)
         .build()
 }
 
@@ -143,6 +201,21 @@ pub fn create_test_config() -> crate::config::Config {
                 },
                 replica_pool: None,
             },
+            // Cap the underway pool in tests — the production default of 100
+            // per-instance multiplies badly under `#[sqlx::test]` parallelism
+            // and exhausts postgres's max_connections.
+            //
+            // Each running underway worker holds two PgListener connections
+            // (shutdown + task-change), and `TaskRunner::start` always spawns
+            // at least one create-batch worker (see `.max(1)` in tasks.rs).
+            // setup_ai_test enables response_workers=1 which adds another
+            // 2 workers = 6 long-lived listeners. 10 gives transient `run_every`
+            // / enqueue / dequeue acquires room to breathe.
+            underway_pool: PoolSettings {
+                max_connections: 10,
+                min_connections: 0,
+                ..Default::default()
+            },
         },
         slow_statement_threshold_ms: 1000,
         host: "127.0.0.1".to_string(),
@@ -202,6 +275,22 @@ pub fn create_test_config() -> crate::config::Config {
                 ..Default::default()
             },
             leader_election: LeaderElectionConfig { enabled: false },
+            notifications: crate::config::NotificationsConfig {
+                webhooks: crate::config::WebhookConfig {
+                    enabled: false,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            sync_workers: crate::config::SyncWorkersConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            task_workers: crate::config::TaskWorkersConfig {
+                create_batch_workers: 0,
+                cascade_batch_state_workers: 0,
+                response_workers: 0,
+            },
             ..Default::default()
         },
         email: crate::config::EmailConfig {
@@ -219,6 +308,9 @@ pub fn create_test_config() -> crate::config::Config {
             ..Default::default()
         },
         onwards: crate::config::OnwardsConfig::default(),
+        onboarding_url: None,
+        support_email: "support@test.com".to_string(),
+        connections: Default::default(),
     }
 }
 
@@ -368,6 +460,7 @@ pub async fn get_system_user(pool: &mut PgConnection) -> UserResponse {
         user_type: "individual".to_string(),
         organizations: None,
         active_organization_id: None,
+        onboarding_redirect_url: None,
     }
 }
 
@@ -392,6 +485,7 @@ pub async fn create_test_api_key_for_user(pool: &PgPool, user_id: UserId) -> Api
             purpose: ApiKeyPurpose::Realtime,
             requests_per_second: None,
             burst_size: None,
+            member_id: None,
         },
     );
 
@@ -512,13 +606,19 @@ pub async fn create_test_org(pool: &PgPool, created_by: UserId) -> UserResponse 
     let mut conn = pool.acquire().await.expect("Failed to acquire connection");
     let mut orgs = Organizations::new(&mut conn);
     let org = orgs
-        .create(&OrganizationCreateDBRequest {
-            name: org_name.clone(),
-            email: format!("{org_name}@example.com"),
-            display_name: Some("Test Organization".to_string()),
-            avatar_url: None,
-            created_by,
-        })
+        .create(
+            &OrganizationCreateDBRequest {
+                name: org_name.clone(),
+                email: format!("{org_name}@example.com"),
+                display_name: Some("Test Organization".to_string()),
+                avatar_url: None,
+                created_by,
+            },
+            &[
+                crate::api::models::users::Role::StandardUser,
+                crate::api::models::users::Role::BatchAPIUser,
+            ],
+        )
         .await
         .expect("Failed to create test organization");
     UserResponse {
@@ -546,6 +646,7 @@ pub async fn create_test_org(pool: &PgPool, created_by: UserId) -> UserResponse 
         user_type: org.user_type,
         organizations: None,
         active_organization_id: None,
+        onboarding_redirect_url: None,
     }
 }
 
