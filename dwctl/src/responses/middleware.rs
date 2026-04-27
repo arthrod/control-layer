@@ -113,8 +113,13 @@ pub async fn responses_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
         "Routing inference request"
     );
 
-    // Generate the request ID upfront — known before any DB calls or proxying.
+    // Generate the request and batch IDs upfront — known before any DB calls
+    // or proxying. The batch_id is set as `x-fusillade-batch-id` on the
+    // proxied request so analytics_handler can associate the http_analytics
+    // row with this batch (otherwise total_cost / token aggregates in the
+    // Batches view come back empty for realtime tracking rows).
     let request_id = uuid::Uuid::new_v4();
+    let batch_id = uuid::Uuid::new_v4();
     let resp_id = format!("resp_{request_id}");
     let completion_window = match service_tier {
         ServiceTier::Flex => "1h",
@@ -165,6 +170,7 @@ pub async fn responses_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
     };
 
     let batch_input = fusillade::CreateSingleRequestBatchInput {
+        batch_id: Some(batch_id),
         request_id,
         body: request_value.to_string(),
         model: model.to_string(),
@@ -177,7 +183,7 @@ pub async fn responses_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
     };
 
     match service_tier {
-        ServiceTier::Realtime => handle_realtime(&state, batch_input, &resp_id, model, background, parts, body_bytes, next).await,
+        ServiceTier::Realtime => handle_realtime(&state, batch_input, batch_id, &resp_id, model, background, parts, body_bytes, next).await,
         ServiceTier::Flex => handle_flex(&state, batch_input, &resp_id, model, background).await,
     }
 }
@@ -219,6 +225,7 @@ fn resolve_service_tier(tier: Option<&str>) -> ServiceTier {
 async fn handle_realtime<P: PoolProvider + Clone + Send + Sync + 'static>(
     state: &ResponsesMiddlewareState<P>,
     batch_input: fusillade::CreateSingleRequestBatchInput,
+    batch_id: uuid::Uuid,
     resp_id: &str,
     model: &str,
     background: bool,
@@ -228,9 +235,10 @@ async fn handle_realtime<P: PoolProvider + Clone + Send + Sync + 'static>(
 ) -> Response {
     let rm = state.request_manager.clone();
 
-    // Capture endpoint before consuming batch_input — needed downstream as a
-    // header so the outlet handler can synthesize the row if create-response
-    // hasn't run yet.
+    // batch_id is passed in explicitly (rather than re-extracted from
+    // batch_input) so the type system enforces its presence — fusillade's
+    // `batch_id` field is `Option<Uuid>` to keep its API friendly for callers
+    // that don't need a pre-generated id, but here we always have one.
     let endpoint_for_header = batch_input.endpoint.clone();
 
     if background {
@@ -245,6 +253,7 @@ async fn handle_realtime<P: PoolProvider + Clone + Send + Sync + 'static>(
         // between proxying and the DB insert still leaves a retryable record.
         // The job resolves attribution and calls create_single_request_batch.
         let job_input = CreateResponseInput {
+            batch_id,
             request_id: batch_input.request_id,
             body: batch_input.body,
             model: batch_input.model,
@@ -270,6 +279,13 @@ async fn handle_realtime<P: PoolProvider + Clone + Send + Sync + 'static>(
     let mut req = Request::from_parts(parts, Body::from(body_bytes));
     req.headers_mut()
         .insert("x-fusillade-request-id", raw_id.parse().expect("response_id is valid header value"));
+    // x-fusillade-batch-id wires this realtime tracking row up to its
+    // http_analytics row so total_cost / token aggregates show up in the
+    // Batches view (analytics_handler reads this header).
+    req.headers_mut().insert(
+        "x-fusillade-batch-id",
+        batch_id.to_string().parse().expect("batch_id is valid header value"),
+    );
     req.headers_mut().insert(
         ONWARDS_RESPONSE_ID_HEADER,
         resp_id.parse().expect("response_id is valid header value"),
