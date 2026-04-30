@@ -5,6 +5,42 @@ import {
   getFirstAccessibleRoute,
 } from "./authorization";
 
+const configWithAsyncEnabled = {
+  region: "test-region",
+  organization: "test-org",
+  payment_enabled: true,
+  docs_url: "https://example.com/docs",
+  onwards: { strict_mode: false },
+  batches: {
+    enabled: true,
+    allowed_completion_windows: ["1h", "24h"],
+    allowed_url_paths: [],
+    async_requests: {
+      enabled: true,
+      completion_window: "1h",
+    },
+  },
+};
+
+const configWithAsyncDisabled = {
+  ...configWithAsyncEnabled,
+  batches: {
+    ...configWithAsyncEnabled.batches,
+    async_requests: {
+      ...configWithAsyncEnabled.batches.async_requests,
+      enabled: false,
+    },
+  },
+};
+
+const configWithBatchesDisabled = {
+  ...configWithAsyncEnabled,
+  batches: {
+    ...configWithAsyncEnabled.batches,
+    enabled: false,
+  },
+};
+
 describe("hasPermission", () => {
   it("returns true when user has a role that grants permission", () => {
     expect(hasPermission(["PlatformManager"], "models")).toBe(true);
@@ -37,6 +73,32 @@ describe("hasPermission", () => {
     expect(hasPermission(["BatchAPIUser"], "api-keys")).toBe(true);
     expect(hasPermission(["BatchAPIUser"], "analytics")).toBe(false);
   });
+
+  it("handles ConnectionsUser role correctly", () => {
+    // ConnectionsUser only grants connections + batches
+    expect(hasPermission(["ConnectionsUser"], "connections")).toBe(true);
+    expect(hasPermission(["ConnectionsUser"], "batches")).toBe(true);
+    // Everything else comes from StandardUser, not ConnectionsUser
+    expect(hasPermission(["ConnectionsUser"], "profile")).toBe(false);
+    expect(hasPermission(["ConnectionsUser"], "api-keys")).toBe(false);
+    expect(hasPermission(["ConnectionsUser"], "models")).toBe(false);
+    expect(hasPermission(["ConnectionsUser"], "analytics")).toBe(false);
+    expect(hasPermission(["ConnectionsUser"], "users-groups")).toBe(false);
+  });
+
+  it("ConnectionsUser combined with StandardUser grants both permission sets", () => {
+    // Roles are additive — StandardUser brings models/api-keys/playground,
+    // ConnectionsUser adds connections/batches
+    expect(
+      hasPermission(["StandardUser", "ConnectionsUser"], "connections"),
+    ).toBe(true);
+    expect(
+      hasPermission(["StandardUser", "ConnectionsUser"], "models"),
+    ).toBe(true);
+    expect(
+      hasPermission(["StandardUser", "ConnectionsUser"], "playground"),
+    ).toBe(true);
+  });
 });
 
 describe("canAccessRoute", () => {
@@ -51,6 +113,27 @@ describe("canAccessRoute", () => {
     expect(canAccessRoute(["StandardUser"], "/analytics")).toBe(false);
   });
 
+  it("allows ConnectionsUser to access /connections and /batches", () => {
+    expect(canAccessRoute(["ConnectionsUser"], "/connections")).toBe(true);
+    expect(canAccessRoute(["ConnectionsUser"], "/batches")).toBe(true);
+  });
+
+  it("denies async and batches routes when disabled in config", () => {
+    expect(
+      canAccessRoute(["ConnectionsUser"], "/async", configWithAsyncDisabled),
+    ).toBe(false);
+    expect(
+      canAccessRoute(["ConnectionsUser"], "/batches", configWithBatchesDisabled),
+    ).toBe(false);
+  });
+
+  it("denies ConnectionsUser access to admin routes", () => {
+    expect(canAccessRoute(["ConnectionsUser"], "/users-groups")).toBe(false);
+    expect(canAccessRoute(["ConnectionsUser"], "/analytics")).toBe(false);
+    expect(canAccessRoute(["ConnectionsUser"], "/endpoints")).toBe(false);
+    expect(canAccessRoute(["ConnectionsUser"], "/settings")).toBe(false);
+  });
+
   it("returns true for unknown routes (no permission required)", () => {
     expect(canAccessRoute(["StandardUser"], "/unknown-route")).toBe(true);
     expect(canAccessRoute([], "/some-new-page")).toBe(true);
@@ -58,20 +141,38 @@ describe("canAccessRoute", () => {
 });
 
 describe("getFirstAccessibleRoute", () => {
-  it("returns /batches as first choice for PlatformManager", () => {
-    expect(getFirstAccessibleRoute(["PlatformManager"])).toBe("/batches");
+  it("returns /models as first choice for PlatformManager", () => {
+    expect(getFirstAccessibleRoute(["PlatformManager"])).toBe("/models");
   });
 
-  it("returns /batches as first choice for BatchAPIUser", () => {
-    expect(getFirstAccessibleRoute(["BatchAPIUser"])).toBe("/batches");
+  it("returns /models as first choice for BatchAPIUser", () => {
+    expect(getFirstAccessibleRoute(["BatchAPIUser"])).toBe("/models");
   });
 
-  it("returns /models as first choice for StandardUser (no batches access)", () => {
+  it("returns /models as first choice for StandardUser", () => {
     expect(getFirstAccessibleRoute(["StandardUser"])).toBe("/models");
   });
 
-  it("returns /models for RequestViewer who can access models but not batches", () => {
+  it("returns /models for RequestViewer who can access models but not async or batches", () => {
     expect(getFirstAccessibleRoute(["RequestViewer"])).toBe("/models");
+  });
+
+  it("returns /async before /batches when models are unavailable", () => {
+    expect(
+      getFirstAccessibleRoute(["ConnectionsUser"], configWithAsyncEnabled),
+    ).toBe("/async");
+  });
+
+  it("skips /async when async requests are disabled", () => {
+    expect(
+      getFirstAccessibleRoute(["ConnectionsUser"], configWithAsyncDisabled),
+    ).toBe("/batches");
+  });
+
+  it("falls back to /profile when both async and batches are disabled", () => {
+    expect(
+      getFirstAccessibleRoute(["ConnectionsUser"], configWithBatchesDisabled),
+    ).toBe("/profile");
   });
 
   it("returns /profile as fallback for empty roles", () => {

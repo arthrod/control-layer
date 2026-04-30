@@ -6,7 +6,7 @@ use outlet_postgres::SerializationError;
 use std::io::Read as _;
 use tracing::instrument;
 
-use super::models::{ChatCompletionChunk, SseParseError};
+use super::models::{ChatCompletionChunk, CompletionChunk, SseParseError};
 
 /// Parse a Server-Sent Events string into a vector of data chunks
 ///
@@ -52,6 +52,22 @@ fn parse_sse_chunks(body_str: &str) -> Result<Vec<String>, SseParseError> {
     Ok(chunks)
 }
 
+/// Converts JSON strings to CompletionChunk objects and wraps in AiResponse
+fn process_completion_sse_chunks(chunks: Vec<String>) -> AiResponse {
+    let chunks = chunks
+        .into_iter()
+        .filter_map(|x| {
+            if x.trim() == "[DONE]" {
+                Some(CompletionChunk::Done)
+            } else {
+                serde_json::from_str::<CompletionChunk>(&x).ok()
+            }
+        })
+        .collect::<Vec<_>>();
+
+    AiResponse::CompletionsStream(chunks)
+}
+
 /// Converts JSON strings to ChatCompletionChunk objects and wraps in AiResponse
 fn process_sse_chunks(chunks: Vec<String>) -> AiResponse {
     let chunks = chunks
@@ -70,11 +86,20 @@ fn process_sse_chunks(chunks: Vec<String>) -> AiResponse {
     AiResponse::ChatCompletionsStream(chunks)
 }
 
+/// Parses legacy /v1/completions streaming response body, trying SSE first then JSON fallback
+#[instrument(skip_all, name = "dwctl.parse_completions_streaming_response")]
+pub(crate) fn parse_completions_streaming_response(body_str: &str) -> Result<AiResponse, Box<dyn std::error::Error>> {
+    parse_sse_chunks(body_str)
+        .map(process_completion_sse_chunks)
+        .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
+        .or_else(|_| serde_json::from_str(body_str).map_err(|e| Box::new(e) as Box<dyn std::error::Error>))
+}
+
 /// Parses streaming response body, trying SSE first then JSON fallback
 ///
 /// # Errors
 /// Returns error if both SSE parsing and JSON deserialization fail
-#[instrument(skip_all)]
+#[instrument(skip_all, name = "dwctl.parse_streaming_response")]
 pub(crate) fn parse_streaming_response(body_str: &str) -> Result<AiResponse, Box<dyn std::error::Error>> {
     // Streaming: expect SSE, fallback to JSON
     parse_sse_chunks(body_str)
@@ -87,20 +112,118 @@ pub(crate) fn parse_streaming_response(body_str: &str) -> Result<AiResponse, Box
 ///
 /// # Errors
 /// Returns error if JSON deserialization fails
-#[instrument(skip_all)]
+#[instrument(skip_all, name = "dwctl.parse_non_streaming_response")]
 pub(crate) fn parse_non_streaming_response(body_str: &str) -> Result<AiResponse, Box<dyn std::error::Error>> {
     serde_json::from_str(body_str).map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
 }
 
 /// Parses a non-streaming /v1/responses response body.
 ///
+/// Tries strict deserialization into [`Response`] first. If that fails (e.g.
+/// because the response was serialized by onwards' own `ResponsesResponse`
+/// schema which differs from async-openai's), falls back to extracting usage
+/// fields from raw JSON and constructing a minimal [`Response`].
+///
 /// # Errors
-/// Returns error if JSON deserialization into [`Response`] fails.
-#[instrument(skip_all)]
+/// Returns error if the body is not valid JSON with an `"object": "response"` field.
+#[instrument(skip_all, name = "dwctl.parse_responses_non_streaming")]
 pub(crate) fn parse_responses_non_streaming_response(body_str: &str) -> Result<AiResponse, Box<dyn std::error::Error>> {
-    serde_json::from_str::<Response>(body_str)
-        .map(AiResponse::Responses)
-        .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
+    // Fast path: try strict deserialization.
+    match serde_json::from_str::<Response>(body_str) {
+        Ok(response) => return Ok(AiResponse::Responses(response)),
+        Err(e) => tracing::debug!(error = %e, "async-openai Response deserialization failed, using fallback"),
+    }
+
+    // Slow path: extract fields from raw JSON. This handles responses
+    // serialized by onwards' ResponsesResponse which has a different schema
+    // (e.g. required fields that async-openai marks optional, different
+    // enum representations for service_tier, truncation, etc.).
+    let value: serde_json::Value = serde_json::from_str(body_str).map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
+
+    // Verify this looks like a Responses API object.
+    if value.get("object").and_then(|v| v.as_str()) != Some("response") {
+        return Err("Not a Responses API response object".into());
+    }
+
+    let model = value.get("model").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
+    let status_str = value.get("status").and_then(|v| v.as_str()).unwrap_or("completed");
+    let status = match status_str {
+        "completed" => async_openai::types::responses::Status::Completed,
+        "failed" => async_openai::types::responses::Status::Failed,
+        "in_progress" => async_openai::types::responses::Status::InProgress,
+        "cancelled" => async_openai::types::responses::Status::Cancelled,
+        "queued" => async_openai::types::responses::Status::Queued,
+        "incomplete" => async_openai::types::responses::Status::Incomplete,
+        _ => async_openai::types::responses::Status::Completed,
+    };
+    let created_at = value.get("created_at").and_then(|v| v.as_u64()).unwrap_or(0);
+    let id = value.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+
+    // Extract usage if present.
+    let usage = value.get("usage").and_then(|u| {
+        use async_openai::types::responses::{InputTokenDetails, OutputTokenDetails, ResponseUsage};
+        let input_tokens = u.get("input_tokens")?.as_u64()? as u32;
+        let output_tokens = u.get("output_tokens")?.as_u64()? as u32;
+        let total_tokens = u
+            .get("total_tokens")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32)
+            .unwrap_or(input_tokens + output_tokens);
+        Some(ResponseUsage {
+            input_tokens,
+            output_tokens,
+            total_tokens,
+            input_tokens_details: InputTokenDetails {
+                cached_tokens: u
+                    .pointer("/input_tokens_details/cached_tokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as u32,
+            },
+            output_tokens_details: OutputTokenDetails {
+                reasoning_tokens: u
+                    .pointer("/output_tokens_details/reasoning_tokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as u32,
+            },
+        })
+    });
+
+    let response = Response {
+        id,
+        object: "response".to_string(),
+        created_at,
+        status,
+        model,
+        output: vec![],
+        usage,
+        // All remaining fields are Option — None by default.
+        background: None,
+        billing: None,
+        conversation: None,
+        completed_at: None,
+        error: None,
+        incomplete_details: None,
+        instructions: None,
+        max_output_tokens: None,
+        metadata: None,
+        parallel_tool_calls: None,
+        previous_response_id: None,
+        prompt: None,
+        prompt_cache_key: None,
+        prompt_cache_retention: None,
+        reasoning: None,
+        safety_identifier: None,
+        service_tier: None,
+        temperature: None,
+        text: None,
+        tool_choice: None,
+        tools: None,
+        top_logprobs: None,
+        top_p: None,
+        truncation: None,
+    };
+
+    Ok(AiResponse::Responses(response))
 }
 
 /// Parses a streaming /v1/responses SSE body into collected events.
@@ -112,7 +235,7 @@ pub(crate) fn parse_responses_non_streaming_response(body_str: &str) -> Result<A
 ///
 /// # Errors
 /// Returns error if no valid SSE data fields are found or all chunks fail to parse.
-#[instrument(skip_all)]
+#[instrument(skip_all, name = "dwctl.parse_responses_streaming")]
 pub(crate) fn parse_responses_streaming_response(body_str: &str) -> Result<AiResponse, Box<dyn std::error::Error>> {
     let chunks = parse_sse_chunks(body_str).map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
 
@@ -132,7 +255,7 @@ pub(crate) fn parse_responses_streaming_response(body_str: &str) -> Result<AiRes
 ///
 /// # Errors
 /// Returns `SerializationError` if brotli decompression fails
-#[instrument(skip_all, name = "decompress_response")]
+#[instrument(skip_all, name = "dwctl.decompress_response")]
 pub(crate) fn decompress_response_if_needed(
     bytes: &[u8],
     headers: &std::collections::HashMap<String, Vec<bytes::Bytes>>,
@@ -146,6 +269,16 @@ pub(crate) fn decompress_response_if_needed(
         .map(|s| s.trim().to_lowercase());
 
     match content_encoding.as_deref() {
+        Some("gzip") => {
+            let mut decompressed = Vec::new();
+            flate2::read::GzDecoder::new(bytes)
+                .read_to_end(&mut decompressed)
+                .map_err(|e| SerializationError {
+                    fallback_data: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes),
+                    error: Box::new(e),
+                })?;
+            Ok(decompressed)
+        }
         Some("br") | Some("brotli") => {
             let mut decompressed = Vec::new();
             brotli::Decompressor::new(bytes, 4096)
@@ -197,7 +330,7 @@ pub(crate) fn extract_header_as_string(request_data: &outlet::RequestData, heade
         .map(|s| s.to_string())
 }
 
-// Mylena & Sebastien 2026 <3
+// Mylena & Sebastien 2026 <3 :)
 
 #[cfg(test)]
 mod tests {
@@ -406,12 +539,42 @@ mod tests {
     fn test_decompress_response_unknown_encoding() {
         let data = b"hello world";
         let mut headers = HashMap::new();
-        headers.insert("content-encoding".to_string(), vec![Bytes::from("gzip")]);
+        headers.insert("content-encoding".to_string(), vec![Bytes::from("deflate")]);
 
         let result = decompress_response_if_needed(data, &headers).unwrap();
 
         // Unknown encoding should pass through unchanged
         assert_eq!(result, data);
+    }
+
+    #[test]
+    fn test_decompress_response_gzip() {
+        use flate2::Compression;
+        use flate2::write::GzEncoder;
+        use std::io::Write as _;
+
+        let original = b"hello world";
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+        encoder.write_all(original).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        let mut headers = HashMap::new();
+        headers.insert("content-encoding".to_string(), vec![Bytes::from("gzip")]);
+
+        let result = decompress_response_if_needed(&compressed, &headers).unwrap();
+
+        assert_eq!(result, original);
+    }
+
+    #[test]
+    fn test_decompress_response_gzip_invalid_data() {
+        let data = b"not valid gzip";
+        let mut headers = HashMap::new();
+        headers.insert("content-encoding".to_string(), vec![Bytes::from("gzip")]);
+
+        let result = decompress_response_if_needed(data, &headers);
+
+        assert!(result.is_err());
     }
 
     // ===== Fusillade Request ID Tests =====
@@ -430,6 +593,8 @@ mod tests {
             uri: "/test".parse::<Uri>().unwrap(),
             headers,
             body: None,
+            trace_id: None,
+            span_id: None,
         };
 
         let result = extract_header_as_string(&request_data, "x-fusillade-request-id").and_then(|s| uuid::Uuid::parse_str(&s).ok());
@@ -450,6 +615,8 @@ mod tests {
             uri: "/test".parse::<Uri>().unwrap(),
             headers,
             body: None,
+            trace_id: None,
+            span_id: None,
         };
 
         let result = extract_header_as_string(&request_data, "x-fusillade-request-id");
@@ -470,6 +637,8 @@ mod tests {
             uri: "/test".parse::<Uri>().unwrap(),
             headers,
             body: None,
+            trace_id: None,
+            span_id: None,
         };
 
         let result = extract_header_as_string(&request_data, "x-fusillade-request-id");
@@ -490,6 +659,8 @@ mod tests {
             uri: "/test".parse::<Uri>().unwrap(),
             headers,
             body: None,
+            trace_id: None,
+            span_id: None,
         };
 
         // String extraction succeeds
@@ -514,6 +685,8 @@ mod tests {
             uri: "/test".parse::<Uri>().unwrap(),
             headers,
             body: None,
+            trace_id: None,
+            span_id: None,
         };
 
         let result = extract_header_as_string(&request_data, "x-fusillade-request-id");
@@ -537,6 +710,8 @@ mod tests {
             uri: "/test".parse::<Uri>().unwrap(),
             headers,
             body: None,
+            trace_id: None,
+            span_id: None,
         };
 
         let result = extract_header_as_string(&request_data, "x-fusillade-request-id").and_then(|s| uuid::Uuid::parse_str(&s).ok());

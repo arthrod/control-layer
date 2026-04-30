@@ -30,13 +30,25 @@ async fn shutdown_signal() {
     }
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        // 8MB stack per worker thread — the default 2MB overflows with deep
+        // tracing-opentelemetry span nesting during batch request processing
+        .thread_stack_size(8 * 1024 * 1024)
+        .build()?
+        .block_on(async_main())
+}
+
+async fn async_main() -> anyhow::Result<()> {
     // Parse CLI args
     let args = dwctl::config::Args::parse();
 
     // Load configuration
     let config = Config::load(&args)?;
+
+    // Validate config consistency
+    config.batches.validate();
 
     // If --validate flag is set, exit successfully after config validation
     if args.validate {
@@ -51,5 +63,8 @@ async fn main() -> anyhow::Result<()> {
 
     // Run the application with graceful shutdown on SIGTERM/Ctrl+C
     let shutdown = shutdown_signal();
-    Application::new(config, tracer_provider).await?.serve(shutdown).await
+    Application::new_with_config_path(config, Some(args.config.clone()), tracer_provider)
+        .await?
+        .serve(shutdown)
+        .await
 }

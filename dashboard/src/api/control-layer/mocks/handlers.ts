@@ -24,6 +24,7 @@ import type {
   AddFundsRequest,
   Role,
   ModelType,
+  ProviderDisplayConfig,
 } from "../types";
 import usersDataRaw from "./users.json";
 import groupsDataRaw from "./groups.json";
@@ -93,6 +94,18 @@ const modelsData = modelsDataRaw.data as Model[];
 const apiKeysData = apiKeysDataRaw as ApiKey[];
 const transactionsData = transactionsDataRaw as Transaction[];
 const organizationsData = organizationsDataRaw as unknown as Organization[];
+let providerDisplayConfigsData: ProviderDisplayConfig[] = [
+  {
+    provider_key: "openai",
+    display_name: "OpenAI",
+    icon: "openai",
+    model_count: 2,
+    configured: true,
+    created_by: "550e8400-e29b-41d4-a716-446655440000",
+    created_at: "2026-03-31T09:00:00Z",
+    updated_at: "2026-03-31T09:00:00Z",
+  },
+];
 
 // Mock organization members
 const orgMembersData: Record<string, OrganizationMember[]> = {
@@ -232,12 +245,12 @@ function resolveComponents(modelId: string): import("../types").ModelComponent[]
 
 // Model tariff data - maps model ID to tariffs
 const modelTariffs: Record<string, ModelTariff[]> = {
-  // Qwen3.5-397B-A17B-FP8 — Realtime $0.60/$3.60 per M
+  // Qwen3.5-397B-A17B-FP8 — realtime $0.60/$3.60 per M
   "d1a2b3c4-e5f6-4a7b-8c9d-0e1f2a3b4c5d": [
     {
       id: "tariff-001",
       deployed_model_id: "d1a2b3c4-e5f6-4a7b-8c9d-0e1f2a3b4c5d",
-      name: "Realtime",
+      name: "realtime",
       input_price_per_token: "0.0000006",
       output_price_per_token: "0.0000036",
       valid_from: "2025-09-15T00:00:00Z",
@@ -249,7 +262,7 @@ const modelTariffs: Record<string, ModelTariff[]> = {
     {
       id: "tariff-002",
       deployed_model_id: "d1a2b3c4-e5f6-4a7b-8c9d-0e1f2a3b4c5d",
-      name: "Batch (24h)",
+      name: "batch",
       input_price_per_token: "0.0000003",
       output_price_per_token: "0.0000018",
       valid_from: "2025-09-15T00:00:00Z",
@@ -261,7 +274,7 @@ const modelTariffs: Record<string, ModelTariff[]> = {
     {
       id: "tariff-003",
       deployed_model_id: "d1a2b3c4-e5f6-4a7b-8c9d-0e1f2a3b4c5d",
-      name: "Batch (1h)",
+      name: "async",
       input_price_per_token: "0.00000045",
       output_price_per_token: "0.0000027",
       valid_from: "2025-09-15T00:00:00Z",
@@ -283,12 +296,12 @@ const modelTariffs: Record<string, ModelTariff[]> = {
       is_active: true,
     },
   ],
-  // Qwen3.5-35B-A3B-FP8 — Realtime $0.25/$2.00 per M
+  // Qwen3.5-35B-A3B-FP8 — realtime $0.25/$2.00 per M
   "d2a3b4c5-e6f7-4a8b-9c0d-1e2f3a4b5c6d": [
     {
       id: "tariff-005",
       deployed_model_id: "d2a3b4c5-e6f7-4a8b-9c0d-1e2f3a4b5c6d",
-      name: "Realtime",
+      name: "realtime",
       input_price_per_token: "0.00000025",
       output_price_per_token: "0.000002",
       valid_from: "2025-09-15T00:00:00Z",
@@ -300,7 +313,7 @@ const modelTariffs: Record<string, ModelTariff[]> = {
     {
       id: "tariff-006",
       deployed_model_id: "d2a3b4c5-e6f7-4a8b-9c0d-1e2f3a4b5c6d",
-      name: "Batch (24h)",
+      name: "batch",
       input_price_per_token: "0.000000125",
       output_price_per_token: "0.000001",
       valid_from: "2025-09-15T00:00:00Z",
@@ -312,7 +325,7 @@ const modelTariffs: Record<string, ModelTariff[]> = {
     {
       id: "tariff-007",
       deployed_model_id: "d2a3b4c5-e6f7-4a8b-9c0d-1e2f3a4b5c6d",
-      name: "Batch (1h)",
+      name: "async",
       input_price_per_token: "0.0000001875",
       output_price_per_token: "0.0000015",
       valid_from: "2025-09-15T00:00:00Z",
@@ -334,12 +347,12 @@ const modelTariffs: Record<string, ModelTariff[]> = {
       is_active: true,
     },
   ],
-  // openai/gpt-oss-20b — Realtime $0.04/$0.30 per M
+  // openai/gpt-oss-20b — realtime $0.04/$0.30 per M
   "d3a4b5c6-e7f8-4a9b-0c1d-2e3f4a5b6c7d": [
     {
       id: "tariff-009",
       deployed_model_id: "d3a4b5c6-e7f8-4a9b-0c1d-2e3f4a5b6c7d",
-      name: "Realtime",
+      name: "realtime",
       input_price_per_token: "0.00000004",
       output_price_per_token: "0.0000003",
       valid_from: "2025-11-01T00:00:00Z",
@@ -351,7 +364,7 @@ const modelTariffs: Record<string, ModelTariff[]> = {
     {
       id: "tariff-010",
       deployed_model_id: "d3a4b5c6-e7f8-4a9b-0c1d-2e3f4a5b6c7d",
-      name: "Batch (24h)",
+      name: "batch",
       input_price_per_token: "0.00000002",
       output_price_per_token: "0.00000015",
       valid_from: "2025-11-01T00:00:00Z",
@@ -363,7 +376,7 @@ const modelTariffs: Record<string, ModelTariff[]> = {
     {
       id: "tariff-011",
       deployed_model_id: "d3a4b5c6-e7f8-4a9b-0c1d-2e3f4a5b6c7d",
-      name: "Batch (1h)",
+      name: "async",
       input_price_per_token: "0.00000003",
       output_price_per_token: "0.000000225",
       valid_from: "2025-11-01T00:00:00Z",
@@ -385,12 +398,12 @@ const modelTariffs: Record<string, ModelTariff[]> = {
       is_active: true,
     },
   ],
-  // Qwen3-VL-235B-A22B-Instruct-FP8 — Realtime $0.60/$1.20 per M
+  // Qwen3-VL-235B-A22B-Instruct-FP8 — realtime $0.60/$1.20 per M
   "d4a5b6c7-e8f9-4a0b-1c2d-3e4f5a6b7c8d": [
     {
       id: "tariff-013",
       deployed_model_id: "d4a5b6c7-e8f9-4a0b-1c2d-3e4f5a6b7c8d",
-      name: "Realtime",
+      name: "realtime",
       input_price_per_token: "0.0000006",
       output_price_per_token: "0.0000012",
       valid_from: "2025-08-20T00:00:00Z",
@@ -402,7 +415,7 @@ const modelTariffs: Record<string, ModelTariff[]> = {
     {
       id: "tariff-014",
       deployed_model_id: "d4a5b6c7-e8f9-4a0b-1c2d-3e4f5a6b7c8d",
-      name: "Batch (24h)",
+      name: "batch",
       input_price_per_token: "0.0000003",
       output_price_per_token: "0.0000006",
       valid_from: "2025-08-20T00:00:00Z",
@@ -414,7 +427,7 @@ const modelTariffs: Record<string, ModelTariff[]> = {
     {
       id: "tariff-015",
       deployed_model_id: "d4a5b6c7-e8f9-4a0b-1c2d-3e4f5a6b7c8d",
-      name: "Batch (1h)",
+      name: "async",
       input_price_per_token: "0.00000045",
       output_price_per_token: "0.0000009",
       valid_from: "2025-08-20T00:00:00Z",
@@ -436,12 +449,12 @@ const modelTariffs: Record<string, ModelTariff[]> = {
       is_active: true,
     },
   ],
-  // Qwen3-VL-30B-A3B-Instruct-FP8 — Realtime $0.16/$0.80 per M
+  // Qwen3-VL-30B-A3B-Instruct-FP8 — realtime $0.16/$0.80 per M
   "d5a6b7c8-e9f0-4a1b-2c3d-4e5f6a7b8c9d": [
     {
       id: "tariff-017",
       deployed_model_id: "d5a6b7c8-e9f0-4a1b-2c3d-4e5f6a7b8c9d",
-      name: "Realtime",
+      name: "realtime",
       input_price_per_token: "0.00000016",
       output_price_per_token: "0.0000008",
       valid_from: "2025-08-20T00:00:00Z",
@@ -453,7 +466,7 @@ const modelTariffs: Record<string, ModelTariff[]> = {
     {
       id: "tariff-018",
       deployed_model_id: "d5a6b7c8-e9f0-4a1b-2c3d-4e5f6a7b8c9d",
-      name: "Batch (24h)",
+      name: "batch",
       input_price_per_token: "0.00000008",
       output_price_per_token: "0.0000004",
       valid_from: "2025-08-20T00:00:00Z",
@@ -465,7 +478,7 @@ const modelTariffs: Record<string, ModelTariff[]> = {
     {
       id: "tariff-019",
       deployed_model_id: "d5a6b7c8-e9f0-4a1b-2c3d-4e5f6a7b8c9d",
-      name: "Batch (1h)",
+      name: "async",
       input_price_per_token: "0.00000012",
       output_price_per_token: "0.0000006",
       valid_from: "2025-08-20T00:00:00Z",
@@ -487,12 +500,12 @@ const modelTariffs: Record<string, ModelTariff[]> = {
       is_active: true,
     },
   ],
-  // Qwen3-14B-FP8 — Realtime $0.05/$0.60 per M
+  // Qwen3-14B-FP8 — realtime $0.05/$0.60 per M
   "d6a7b8c9-e0f1-4a2b-3c4d-5e6f7a8b9c0d": [
     {
       id: "tariff-021",
       deployed_model_id: "d6a7b8c9-e0f1-4a2b-3c4d-5e6f7a8b9c0d",
-      name: "Realtime",
+      name: "realtime",
       input_price_per_token: "0.00000005",
       output_price_per_token: "0.0000006",
       valid_from: "2025-07-10T00:00:00Z",
@@ -504,7 +517,7 @@ const modelTariffs: Record<string, ModelTariff[]> = {
     {
       id: "tariff-022",
       deployed_model_id: "d6a7b8c9-e0f1-4a2b-3c4d-5e6f7a8b9c0d",
-      name: "Batch (24h)",
+      name: "batch",
       input_price_per_token: "0.000000025",
       output_price_per_token: "0.0000003",
       valid_from: "2025-07-10T00:00:00Z",
@@ -516,7 +529,7 @@ const modelTariffs: Record<string, ModelTariff[]> = {
     {
       id: "tariff-023",
       deployed_model_id: "d6a7b8c9-e0f1-4a2b-3c4d-5e6f7a8b9c0d",
-      name: "Batch (1h)",
+      name: "async",
       input_price_per_token: "0.0000000375",
       output_price_per_token: "0.00000045",
       valid_from: "2025-07-10T00:00:00Z",
@@ -538,12 +551,12 @@ const modelTariffs: Record<string, ModelTariff[]> = {
       is_active: true,
     },
   ],
-  // Qwen3-Embedding-8B — Realtime $0.04/$0.00 per M
+  // Qwen3-Embedding-8B — realtime $0.04/$0.00 per M
   "d7a8b9c0-e1f2-4a3b-4c5d-6e7f8a9b0c1d": [
     {
       id: "tariff-025",
       deployed_model_id: "d7a8b9c0-e1f2-4a3b-4c5d-6e7f8a9b0c1d",
-      name: "Realtime",
+      name: "realtime",
       input_price_per_token: "0.00000004",
       output_price_per_token: "0",
       valid_from: "2025-07-10T00:00:00Z",
@@ -555,7 +568,7 @@ const modelTariffs: Record<string, ModelTariff[]> = {
     {
       id: "tariff-026",
       deployed_model_id: "d7a8b9c0-e1f2-4a3b-4c5d-6e7f8a9b0c1d",
-      name: "Batch (24h)",
+      name: "batch",
       input_price_per_token: "0.00000002",
       output_price_per_token: "0",
       valid_from: "2025-07-10T00:00:00Z",
@@ -577,12 +590,12 @@ const modelTariffs: Record<string, ModelTariff[]> = {
       is_active: true,
     },
   ],
-  // Qwen3.5-9B — Realtime $0.10/$0.40 per M, Batch $0.05/$0.20 per M
+  // Qwen3.5-9B — realtime $0.10/$0.40 per M, batch $0.05/$0.20 per M
   "d8b9c0d1-e2f3-4a4b-5c6d-7e8f9a0b1c2d": [
     {
       id: "tariff-028",
       deployed_model_id: "d8b9c0d1-e2f3-4a4b-5c6d-7e8f9a0b1c2d",
-      name: "Realtime",
+      name: "realtime",
       input_price_per_token: "0.0000001",
       output_price_per_token: "0.0000004",
       valid_from: "2026-03-02T00:00:00Z",
@@ -594,7 +607,7 @@ const modelTariffs: Record<string, ModelTariff[]> = {
     {
       id: "tariff-029",
       deployed_model_id: "d8b9c0d1-e2f3-4a4b-5c6d-7e8f9a0b1c2d",
-      name: "Batch (24h)",
+      name: "batch",
       input_price_per_token: "0.00000005",
       output_price_per_token: "0.0000002",
       valid_from: "2026-03-02T00:00:00Z",
@@ -1032,6 +1045,7 @@ export const handlers = [
       url: string;
       event_types?: string[];
       description?: string;
+      scope?: string;
     };
     const now = new Date().toISOString();
     return HttpResponse.json(
@@ -1042,6 +1056,7 @@ export const handlers = [
         enabled: true,
         event_types: body.event_types || null,
         description: body.description || null,
+        scope: body.scope || "own",
         created_at: now,
         updated_at: now,
         disabled_at: null,
@@ -1062,6 +1077,7 @@ export const handlers = [
         enabled: body.enabled !== undefined ? body.enabled : true,
         event_types: body.event_types !== undefined ? body.event_types : null,
         description: body.description !== undefined ? body.description : null,
+        scope: "own",
         created_at: new Date().toISOString(),
         updated_at: new Date().toISOString(),
         disabled_at: null,
@@ -1083,6 +1099,7 @@ export const handlers = [
         enabled: true,
         event_types: null,
         description: null,
+        scope: "own",
         created_at: new Date().toISOString(),
         updated_at: new Date().toISOString(),
         disabled_at: null,
@@ -1090,6 +1107,62 @@ export const handlers = [
       });
     },
   ),
+
+  // Provider display configs API
+  http.get("/admin/api/v1/provider-display-configs", () => {
+    return HttpResponse.json(providerDisplayConfigsData);
+  }),
+
+  http.get("/admin/api/v1/provider-display-configs/:providerKey", ({ params }) => {
+    const provider = providerDisplayConfigsData.find((item) => item.provider_key === params.providerKey);
+    if (!provider) {
+      return HttpResponse.json(
+        { error: "Provider display config not found" },
+        { status: 404 },
+      );
+    }
+    return HttpResponse.json(provider);
+  }),
+
+  http.post("/admin/api/v1/provider-display-configs", async ({ request }) => {
+    const body = (await request.json()) as Partial<ProviderDisplayConfig>;
+    const created: ProviderDisplayConfig = {
+      provider_key: body.provider_key || "provider",
+      display_name: body.display_name || body.provider_key || "Provider",
+      icon: body.icon || null,
+      model_count: 0,
+      configured: true,
+      created_by: usersData[0]?.id || crypto.randomUUID(),
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    };
+    providerDisplayConfigsData = [...providerDisplayConfigsData, created];
+    return HttpResponse.json(created, { status: 201 });
+  }),
+
+  http.patch("/admin/api/v1/provider-display-configs/:providerKey", async ({ params, request }) => {
+    const index = providerDisplayConfigsData.findIndex((item) => item.provider_key === params.providerKey);
+    if (index === -1) {
+      return HttpResponse.json(
+        { error: "Provider display config not found" },
+        { status: 404 },
+      );
+    }
+    const body = (await request.json()) as Partial<ProviderDisplayConfig>;
+    providerDisplayConfigsData[index] = {
+      ...providerDisplayConfigsData[index],
+      ...body,
+      updated_at: new Date().toISOString(),
+    };
+    return HttpResponse.json(providerDisplayConfigsData[index]);
+  }),
+
+  http.delete("/admin/api/v1/provider-display-configs/:providerKey", ({ params }) => {
+    providerDisplayConfigsData = providerDisplayConfigsData.filter(
+      (item) => item.provider_key !== params.providerKey,
+    );
+    return new HttpResponse(null, { status: 204 });
+  }),
 
   // Models API
   http.get("/admin/api/v1/models", ({ request }) => {
@@ -2862,7 +2935,9 @@ export const handlers = [
             backoff_ms: 1000,
             backoff_factor: 2.0,
             max_backoff_ms: 30000,
-            timeout_ms: 300000,
+            first_chunk_timeout_ms: 86400000,
+            chunk_timeout_ms: 86400000,
+            body_timeout_ms: 86400000,
             status_log_interval_ms: null,
             heartbeat_interval_ms: 5000,
             claim_timeout_ms: 60000,
@@ -2894,7 +2969,9 @@ export const handlers = [
             backoff_ms: 1000,
             backoff_factor: 2.0,
             max_backoff_ms: 30000,
-            timeout_ms: 300000,
+            first_chunk_timeout_ms: 86400000,
+            chunk_timeout_ms: 86400000,
+            body_timeout_ms: 86400000,
             status_log_interval_ms: null,
             heartbeat_interval_ms: 5000,
             claim_timeout_ms: 60000,
@@ -2926,7 +3003,9 @@ export const handlers = [
             backoff_ms: 1000,
             backoff_factor: 2.0,
             max_backoff_ms: 30000,
-            timeout_ms: 300000,
+            first_chunk_timeout_ms: 86400000,
+            chunk_timeout_ms: 86400000,
+            body_timeout_ms: 86400000,
             status_log_interval_ms: null,
             heartbeat_interval_ms: 5000,
             claim_timeout_ms: 60000,
@@ -2935,5 +3014,10 @@ export const handlers = [
         },
       ],
     });
+  }),
+
+  // Support request (mock)
+  http.post("/admin/api/v1/support/requests", () => {
+    return HttpResponse.json({ sent: true });
   }),
 ];

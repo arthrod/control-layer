@@ -6,7 +6,6 @@
 
 use sqlx_pool_router::PoolProvider;
 
-use super::sla_capacity::{check_sla_capacity, parse_window_to_seconds};
 use crate::AppState;
 use crate::api::models::batches::{
     BatchAnalytics, BatchErrors, BatchListResponse, BatchObjectType, BatchResponse, BatchResultsQuery, CreateBatchRequest,
@@ -14,7 +13,8 @@ use crate::api::models::batches::{
 };
 use crate::api::models::users::CurrentUser;
 use crate::auth::permissions::{RequiresPermission, can_read_all_resources, has_permission, operation, resource};
-use crate::db::handlers::{Credits, Users, repository::Repository};
+use crate::db::handlers::{Connections, Credits, Users, api_keys::ApiKeys, repository::Repository};
+use crate::db::models::api_keys::ApiKeyPurpose;
 use crate::errors::{Error, Result};
 use crate::types::{Operation, Resource};
 use axum::{
@@ -24,27 +24,218 @@ use axum::{
     http::StatusCode,
 };
 use bytes::Bytes;
-use chrono::{Duration, Utc};
 use fusillade::Storage;
 use futures::StreamExt;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::pin::Pin;
 use uuid::Uuid;
 
-/// Check if the current user "owns" a batch, considering org context.
-/// Returns true if the batch creator matches the user's ID or their active organization.
-fn is_batch_owner(current_user: &CurrentUser, created_by: Option<&str>) -> bool {
-    let user_id = current_user.id.to_string();
-    if created_by == Some(user_id.as_str()) {
-        return true;
-    }
-    if let Some(org_id) = current_user.active_organization {
-        let org_id_str = org_id.to_string();
-        if created_by == Some(org_id_str.as_str()) {
-            return true;
+// ---------------------------------------------------------------------------
+// Background task: batch population
+// ---------------------------------------------------------------------------
+
+/// Input for the batch population background job.
+///
+/// After the handler creates a batch record and returns it to the client,
+/// this job copies templates into requests in the background.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CreateBatchInput {
+    pub batch_id: Uuid,
+    pub file_id: Uuid,
+}
+
+/// Build the underway job for batch population.
+pub async fn build_create_batch_job<P: sqlx_pool_router::PoolProvider + Clone + Send + Sync + 'static>(
+    pool: sqlx::PgPool,
+    state: crate::tasks::TaskState<P>,
+) -> anyhow::Result<underway::Job<CreateBatchInput, crate::tasks::TaskState<P>>> {
+    use underway::Job;
+    use underway::job::To;
+    use underway::task::Error as TaskError;
+
+    Job::<CreateBatchInput, _>::builder()
+        .state(state)
+        .step(|cx, input: CreateBatchInput| async move {
+            let batch_id = fusillade::BatchId(input.batch_id);
+
+            if let Err(e) = cx
+                .state
+                .request_manager
+                .populate_batch(batch_id, fusillade::FileId(input.file_id))
+                .await
+            {
+                tracing::error!(
+                    batch_id = %input.batch_id,
+                    error = %e,
+                    "Failed to populate batch"
+                );
+
+                return match &e {
+                    fusillade::FusilladeError::ValidationError(_) => {
+                        if let Err(mark_err) = cx.state.request_manager.mark_batch_failed(batch_id, &e.to_string()).await {
+                            tracing::error!(
+                                batch_id = %input.batch_id,
+                                error = %mark_err,
+                                "Failed to mark batch as failed after validation error"
+                            );
+                            Err(TaskError::Retryable(mark_err.to_string()))
+                        } else {
+                            Err(TaskError::Fatal(e.to_string()))
+                        }
+                    }
+                    _ => Err(TaskError::Retryable(e.to_string())),
+                };
+            }
+
+            tracing::info!(batch_id = %input.batch_id, "Batch populated");
+            To::done()
+        })
+        .name("create-batch")
+        .pool(pool)
+        .build()
+        .await
+        .map_err(Into::into)
+}
+
+// ---------------------------------------------------------------------------
+// Background task: cascade batch state to child requests
+// ---------------------------------------------------------------------------
+
+/// Target state for cascading to child requests. Local mirror of
+/// `fusillade::CascadeTargetState` with serde support for underway
+/// JSON serialization.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CascadeTarget {
+    Canceled,
+    Failed,
+}
+
+impl CascadeTarget {
+    fn to_fusillade(self) -> fusillade::CascadeTargetState {
+        match self {
+            CascadeTarget::Canceled => fusillade::CascadeTargetState::Canceled,
+            CascadeTarget::Failed => fusillade::CascadeTargetState::Failed,
         }
     }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            CascadeTarget::Canceled => "canceled",
+            CascadeTarget::Failed => "failed",
+        }
+    }
+}
+
+/// Input for the cascade-batch-state background job.
+///
+/// After a batch is cancelled (or otherwise terminates), this job updates
+/// child requests that are still in-flight (pending/claimed/processing) to
+/// the target state. This is done asynchronously so the cancel API stays
+/// O(1) while the child rows are cleaned up in the background.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CascadeBatchStateInput {
+    pub batch_id: Uuid,
+    pub target_state: CascadeTarget,
+}
+
+/// Build the underway job for cascading batch state to child requests.
+pub async fn build_cascade_batch_state_job<P: sqlx_pool_router::PoolProvider + Clone + Send + Sync + 'static>(
+    pool: sqlx::PgPool,
+    state: crate::tasks::TaskState<P>,
+) -> anyhow::Result<underway::Job<CascadeBatchStateInput, crate::tasks::TaskState<P>>> {
+    use underway::Job;
+    use underway::job::To;
+    use underway::task::Error as TaskError;
+
+    Job::<CascadeBatchStateInput, _>::builder()
+        .state(state)
+        .step(|cx, input: CascadeBatchStateInput| async move {
+            let batch_id = fusillade::BatchId(input.batch_id);
+
+            match cx
+                .state
+                .request_manager
+                .cascade_batch_state_to_requests(batch_id, input.target_state.to_fusillade())
+                .await
+            {
+                Ok(updated) => {
+                    if updated > 0 {
+                        tracing::info!(
+                            batch_id = %input.batch_id,
+                            target_state = input.target_state.as_str(),
+                            updated,
+                            "Cascaded batch state to child requests"
+                        );
+                    }
+                    To::done()
+                }
+                Err(e) => {
+                    tracing::error!(
+                        batch_id = %input.batch_id,
+                        target_state = input.target_state.as_str(),
+                        error = %e,
+                        "Failed to cascade batch state to child requests"
+                    );
+                    Err(TaskError::Retryable(e.to_string()))
+                }
+            }
+        })
+        .name("cascade-batch-state")
+        .pool(pool)
+        .build()
+        .await
+        .map_err(Into::into)
+}
+
+// ---------------------------------------------------------------------------
+
+/// Parse the comma-separated `completion_window` query param into the vec of
+/// values passed to fusillade. Returns `None` (no filter) when the param is
+/// missing or contains only whitespace. Values are forwarded as-is so callers
+/// can match any window string fusillade understands (e.g. `"24h"`, `"1h"`,
+/// `"0s"`, `"7d"`).
+fn parse_completion_window_filter(raw: Option<&str>) -> Option<Vec<String>> {
+    let raw = raw?;
+    let windows: Vec<String> = raw.split(',').map(str::trim).filter(|s| !s.is_empty()).map(String::from).collect();
+    if windows.is_empty() { None } else { Some(windows) }
+}
+
+/// Check if the current user "owns" a batch, considering org context.
+/// Returns true if the batch creator matches the user's ID or their active organization.
+fn is_batch_owner(current_user: &CurrentUser, created_by: &str) -> bool {
+    let user_id = current_user.id.to_string();
+    if created_by == user_id {
+        return true;
+    }
+    if let Some(org_id) = current_user.active_organization
+        && created_by == org_id.to_string()
+    {
+        return true;
+    }
     false
+}
+
+/// Enqueue a background job to transition in-flight child requests to
+/// the given target state. Best-effort: logs a warning on failure so the
+/// caller (cancel/delete handler) can still return a success response.
+async fn enqueue_cascade_batch_state<P: PoolProvider>(state: &AppState<P>, batch_id: Uuid, target_state: CascadeTarget) {
+    let Some(ref job) = state.task_runner.cascade_batch_state_job else {
+        tracing::debug!(
+            batch_id = %batch_id,
+            "cascade-batch-state job not configured, skipping enqueue"
+        );
+        return;
+    };
+    if let Err(e) = job.enqueue(&CascadeBatchStateInput { batch_id, target_state }).await {
+        tracing::warn!(
+            batch_id = %batch_id,
+            target_state = target_state.as_str(),
+            error = %e,
+            "Failed to enqueue cascade-batch-state job (child requests will remain in old state)"
+        );
+    }
 }
 
 /// Helper function to convert fusillade Batch to OpenAI BatchResponse
@@ -52,20 +243,48 @@ fn is_batch_owner(current_user: &CurrentUser, created_by: Option<&str>) -> bool 
 /// If `creator_email` is provided, it will be injected into the metadata as `created_by_email`.
 /// This is used to populate the email without storing it in the batch metadata (PII concern).
 fn to_batch_response_with_email(batch: fusillade::Batch, creator_email: Option<&str>) -> BatchResponse {
-    // Convert metadata from serde_json::Value to HashMap<String, String>
-    let mut metadata: Option<HashMap<String, String>> = batch.metadata.and_then(|m| {
-        m.as_object().map(|obj| {
-            obj.iter()
-                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
-                .collect()
-        })
-    });
+    to_batch_response_enriched(batch, creator_email, None)
+}
 
-    // Inject created_by_email into metadata if we have it
+fn to_batch_response_enriched(batch: fusillade::Batch, creator_email: Option<&str>, source_name: Option<&str>) -> BatchResponse {
+    use crate::api::models::dwext::BatchDwExtResponse;
+
+    // Convert metadata from serde_json::Value to HashMap<String, String>
+    let raw_metadata: HashMap<String, String> = batch
+        .metadata
+        .and_then(|m| {
+            m.as_object().map(|obj| {
+                obj.iter()
+                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                    .collect()
+            })
+        })
+        .unwrap_or_default();
+
+    // Build dwext from dw_* metadata keys + optional source_name override
+    let request_source = raw_metadata.get("request_source").cloned();
+    let dwext = BatchDwExtResponse {
+        source: request_source.clone(),
+        source_id: raw_metadata.get("dw_source_id").cloned(),
+        // Prefer resolved name from DB (reflects renames) over stored metadata
+        source_name: source_name
+            .map(|s| s.to_string())
+            .or_else(|| raw_metadata.get("dw_source_name").cloned()),
+        source_file: raw_metadata.get("dw_external_key").cloned(),
+        sync_id: raw_metadata.get("dw_sync_id").cloned(),
+    };
+
+    // Build user-facing metadata: filter out internal dw_* keys.
+    // Keep request_source, created_by_email, context_name, context_type for backwards compat.
+    let internal_keys = ["dw_source_id", "dw_source_name", "dw_sync_id", "dw_external_key", "created_by"];
+    let mut metadata: HashMap<String, String> = raw_metadata
+        .into_iter()
+        .filter(|(k, _)| !internal_keys.contains(&k.as_str()))
+        .collect();
+
+    // Inject created_by_email into metadata for backwards compatibility
     if let Some(email) = creator_email {
-        metadata
-            .get_or_insert_with(HashMap::new)
-            .insert("created_by_email".to_string(), email.to_string());
+        metadata.insert("created_by_email".to_string(), email.to_string());
     }
 
     // Determine OpenAI status from request counts
@@ -81,7 +300,12 @@ fn to_batch_response_with_email(batch: fusillade::Batch, creator_email: Option<&
             // Still cancelling
             "cancelling"
         }
-    } else if batch.total_requests == 0 {
+    } else if batch.failed_at.is_some() && !has_started {
+        // Batch failed before population (e.g. empty file, validation error)
+        "failed"
+    } else if !has_started {
+        // Batch hasn't been populated yet — total_requests may already be set
+        // from the template count at creation time, but no request rows exist yet.
         "validating"
     } else if is_finished && batch.failed_requests == batch.total_requests {
         // All requests failed (batch.failed_requests already filtered by SLA status)
@@ -161,16 +385,19 @@ fn to_batch_response_with_email(batch: fusillade::Batch, creator_email: Option<&
             completed: batch.completed_requests,
             failed: batch.failed_requests,
         },
-        metadata,
+        metadata: if metadata.is_empty() { None } else { Some(metadata) },
         analytics: None,
+        dwext: if dwext.is_empty() { None } else { Some(dwext) },
     }
 }
 
 /// Helper to fetch creator email for a batch from the database.
 ///
 async fn fetch_creator_email(db: &sqlx::PgPool, batch: &fusillade::Batch) -> Option<String> {
-    let created_by = batch.created_by.as_ref()?;
-    let user_id = Uuid::parse_str(created_by).ok()?;
+    if batch.created_by.is_empty() {
+        return None;
+    }
+    let user_id = Uuid::parse_str(&batch.created_by).ok()?;
     let mut conn = db.acquire().await.ok()?;
     Users::new(&mut conn).get_by_id(user_id).await.ok().flatten().map(|u| u.email)
 }
@@ -199,9 +426,13 @@ pub async fn create_batch<P: PoolProvider>(
     has_api_key: crate::auth::current_user::HasApiKey,
     Json(req): Json<CreateBatchRequest>,
 ) -> Result<(StatusCode, Json<BatchResponse>)> {
-    // Validate completion_window against configured allowed values
-    if !state.config.batches.allowed_completion_windows.contains(&req.completion_window) {
-        let allowed: Vec<&str> = state.config.batches.allowed_completion_windows.iter().map(|w| w.as_str()).collect();
+    let config = state.current_config();
+    // Users with Batches::CreateAll (PlatformManager, admins) can use any
+    // completion window that humantime can parse. Everyone else is restricted
+    // to the configured allowed values.
+    let can_use_any_window = has_permission(&current_user, Resource::Batches, Operation::CreateAll);
+    if !can_use_any_window && !config.batches.allowed_completion_windows.contains(&req.completion_window) {
+        let allowed: Vec<&str> = config.batches.allowed_completion_windows.iter().map(|w| w.as_str()).collect();
 
         return Err(Error::BadRequest {
             message: format!("Unsupported completion_window. Allowed values: {}", allowed.join(", ")),
@@ -209,7 +440,7 @@ pub async fn create_batch<P: PoolProvider>(
     }
 
     // Validate endpoint
-    let supported_endpoints = &state.config.batches.allowed_url_paths;
+    let supported_endpoints = &config.batches.allowed_url_paths;
     if !supported_endpoints.iter().any(|endpoint| endpoint == &req.endpoint) {
         return Err(Error::BadRequest {
             message: format!(
@@ -225,13 +456,15 @@ pub async fn create_batch<P: PoolProvider>(
         message: "Invalid input_file_id format".to_string(),
     })?;
 
-    // Reject batches from users with negative credit balance
+    // Reject batches from users/orgs with negative credit balance.
+    // In org context, check the org's balance rather than the user's personal balance.
+    let balance_check_id = current_user.active_organization.unwrap_or(current_user.id);
     {
         let mut conn = state.db.write().acquire().await.map_err(|e| Error::Internal {
             operation: format!("get db connection for credit check: {}", e),
         })?;
         let balance = Credits::new(&mut conn)
-            .get_user_balance(current_user.id)
+            .get_user_balance(balance_check_id)
             .await
             .map_err(|e| Error::Internal {
                 operation: format!("check credit balance: {}", e),
@@ -259,7 +492,12 @@ pub async fn create_batch<P: PoolProvider>(
     // In org context, files owned by the active org are also considered "own"
     use crate::types::Resource;
     let has_read_all = can_read_all_resources(&current_user, Resource::Files);
-    if !has_read_all && !is_batch_owner(&current_user, file.uploaded_by.as_deref()) {
+    if !has_read_all
+        && !file
+            .uploaded_by
+            .as_deref()
+            .is_some_and(|owner| is_batch_owner(&current_user, owner))
+    {
         use crate::types::{Operation, Permission};
         return Err(Error::InsufficientPermissions {
             required: Permission::Allow(Resource::Files, Operation::ReadAll),
@@ -334,27 +572,26 @@ pub async fn create_batch<P: PoolProvider>(
             })?
     };
 
-    // Check per-model batch completion window restrictions
-    for (alias, allowed_windows) in &batch_model_info.allowed_windows {
-        if !allowed_windows.contains(&req.completion_window) {
-            if allowed_windows.is_empty() {
+    // Check per-model batch completion window restrictions (skipped for elevated users)
+    if !can_use_any_window {
+        for (alias, allowed_windows) in &batch_model_info.allowed_windows {
+            if !allowed_windows.contains(&req.completion_window) {
+                if allowed_windows.is_empty() {
+                    return Err(Error::BadRequest {
+                        message: format!("Model '{}' does not support batch processing.", alias),
+                    });
+                }
                 return Err(Error::BadRequest {
-                    message: format!("Model '{}' does not support batch processing.", alias),
+                    message: format!(
+                        "Model '{}' does not support completion window '{}'. Allowed: {}",
+                        alias,
+                        req.completion_window,
+                        allowed_windows.join(", ")
+                    ),
                 });
             }
-            return Err(Error::BadRequest {
-                message: format!(
-                    "Model '{}' does not support completion window '{}'. Allowed: {}",
-                    alias,
-                    req.completion_window,
-                    allowed_windows.join(", ")
-                ),
-            });
         }
     }
-
-    let windows = vec![(req.completion_window.clone(), parse_window_to_seconds(&req.completion_window))];
-    let states = vec!["pending".to_string(), "claimed".to_string(), "processing".to_string()];
 
     let model_throughputs = batch_model_info.throughputs;
     let model_ids_by_alias = get_model_ids_by_aliases(&state, &model_aliases).await?;
@@ -367,22 +604,41 @@ pub async fn create_batch<P: PoolProvider>(
     // When in org context, attribute batch ownership to the org
     let target_user_id = current_user.active_organization.unwrap_or(current_user.id);
 
-    // Convert metadata to HashMap and inject request_source and user info
-    // Note: created_by_email is NOT stored in metadata to avoid PII in denormalized storage.
-    // The email is fetched via user lookup when building API responses.
-    // metadata.created_by tracks the individual user for audit trail
+    // Get the hidden API key for batch execution and per-member attribution.
+    // The secret is stored on the batch so the daemon uses the batch creator's
+    // credentials, not the file uploader's key from request_templates.
+    let (batch_api_key, api_key_id) = {
+        let mut conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
+        let mut api_keys_repo = ApiKeys::new(&mut conn);
+        let (secret, key_id) = api_keys_repo
+            .get_or_create_hidden_key_with_id(target_user_id, ApiKeyPurpose::Batch, current_user.id)
+            .await
+            .map_err(Error::Database)?;
+        (secret, key_id)
+    };
+
+    // Convert metadata to HashMap and inject request_source and user info.
+    // Strip reserved keys that are injected server-side during response enrichment
+    // to prevent user-supplied values from colliding with system fields.
     let mut metadata_map = req.metadata.unwrap_or_default();
+    for key in &["created_by_email", "context_name", "context_type", "request_source", "created_by"] {
+        metadata_map.remove(*key);
+    }
     metadata_map.insert("request_source".to_string(), request_source.to_string());
     metadata_map.insert("created_by".to_string(), current_user.id.to_string());
     let metadata = serde_json::to_value(metadata_map).ok();
 
     // Create batch input — created_by uses org ID when in org context for ownership scoping
+    let total_requests: i64 = file_model_counts.values().sum();
     let batch_input = fusillade::BatchInput {
         file_id: fusillade::FileId(file_id),
         endpoint: req.endpoint.clone(),
         completion_window: req.completion_window.clone(),
         metadata,
         created_by: Some(target_user_id.to_string()),
+        api_key_id: Some(api_key_id),
+        api_key: Some(batch_api_key),
+        total_requests: Some(total_requests),
     };
 
     let reservation_ids = reserve_capacity_for_batch(
@@ -391,10 +647,7 @@ pub async fn create_batch<P: PoolProvider>(
         &file_model_counts,
         &model_throughputs,
         &model_ids_by_alias,
-        &windows,
-        &states,
-        &model_aliases,
-        state.config.batches.relaxation_factor(&req.completion_window),
+        config.batches.relaxation_factor(&req.completion_window),
     )
     .await?;
 
@@ -415,11 +668,39 @@ pub async fn create_batch<P: PoolProvider>(
         });
     });
 
-    let batch = state.request_manager.create_batch(batch_input).await.map_err(|e| Error::Internal {
-        operation: format!("create batch: {}", e),
-    })?;
+    // Batch record (fusillade DB) and job enqueue (dwctl DB) are on separate databases,
+    // so true atomicity isn't possible. Each is a single independent write.
+    let batch = state
+        .request_manager
+        .create_batch_record(batch_input)
+        .await
+        .map_err(|e| Error::Internal {
+            operation: format!("create batch record: {}", e),
+        })?;
 
-    tracing::debug!("Batch {} created successfully", batch.id);
+    // Enqueue background job to populate requests from templates.
+    if let Err(e) = state
+        .task_runner
+        .create_batch_job
+        .enqueue(&CreateBatchInput {
+            batch_id: *batch.id,
+            file_id,
+        })
+        .await
+    {
+        let _ = state
+            .request_manager
+            .mark_batch_failed(batch.id, &format!("Failed to enqueue population: {e}"))
+            .await;
+        return Err(Error::Internal {
+            operation: format!("enqueue batch population: {}", e),
+        });
+    }
+
+    tracing::debug!("Batch {} created, population enqueued", batch.id);
+
+    // batch.created webhook deliveries are created by the notification poller
+    // which polls fusillade.batches for new records.
 
     // For create, we have the current user's email directly
     Ok((
@@ -516,145 +797,46 @@ async fn get_model_ids_by_aliases<P: PoolProvider>(state: &AppState<P>, model_al
 ///
 /// In short: the race is an inherent consequence of reading across two independent
 /// connections, but the read order ensures it always errs on the side of caution.
-#[allow(clippy::too_many_arguments)]
+/// Thin wrapper around the shared `reserve_capacity` for the API handler context.
+/// Converts `CapacityError` to the API's `Error` type.
 async fn reserve_capacity_for_batch<P: PoolProvider>(
     state: &AppState<P>,
     completion_window: &str,
     file_model_counts: &HashMap<String, i64>,
     model_throughputs: &HashMap<String, f32>,
     model_ids_by_alias: &HashMap<String, Uuid>,
-    windows: &[(String, i64)],
-    states: &[String],
-    model_filter: &[String],
     relaxation_factor: f32,
 ) -> Result<Vec<Uuid>> {
-    use crate::db::handlers::BatchCapacityReservations;
+    use super::sla_capacity::{CapacityError, CapacityReservationInput, reserve_capacity};
 
-    let mut tx = state.db.write().begin().await.map_err(|e| Error::Internal {
-        operation: format!("begin reservation transaction: {}", e),
-    })?;
-
-    // Lock per model+window in deterministic order
-    let mut model_pairs: Vec<(String, Uuid)> = model_ids_by_alias.iter().map(|(a, id)| (a.clone(), *id)).collect();
-    model_pairs.sort_by_key(|(_, id)| *id);
-
-    for (alias, model_id) in &model_pairs {
-        sqlx::query!(
-            "SELECT pg_advisory_xact_lock(hashtext($1::text), hashtext($2::text))",
-            model_id.to_string(),
-            completion_window
-        )
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| Error::Internal {
-            operation: format!("lock reservation for {}: {}", alias, e),
-        })?;
-    }
-
-    // Sum active reservations and add to pending_counts
-    let model_ids: Vec<Uuid> = model_pairs.iter().map(|(_, id)| *id).collect();
-    let id_to_alias: HashMap<Uuid, String> = model_pairs.iter().map(|(a, id)| (*id, a.clone())).collect();
-    let mut reservations = BatchCapacityReservations::new(&mut tx);
-
-    let reserved_rows = reservations
-        .sum_active_by_model_window(&model_ids, completion_window)
-        .await
-        .map_err(|e| Error::Internal {
-            operation: format!("sum active reservations: {}", e),
-        })?;
-
-    // Fetch pending counts AFTER locks to avoid stale snapshots
-    let pending_counts = state
-        .request_manager
-        .get_pending_request_counts_by_model_and_completion_window(windows, states, model_filter, true)
-        .await
-        .map_err(|e| Error::Internal {
-            operation: format!("get pending counts: {}", e),
-        })?;
-
-    let mut pending_with_reservations = pending_counts.clone();
-    for (model_id, reserved) in reserved_rows {
-        if let Some(alias) = id_to_alias.get(&model_id) {
-            let windows = pending_with_reservations.entry(alias.clone()).or_default();
-            let entry = windows.entry(completion_window.to_string()).or_insert(0);
-            *entry += reserved;
-        }
-    }
-
-    let capacity_result = check_sla_capacity(
-        file_model_counts,
-        &pending_with_reservations,
-        model_throughputs,
-        state.config.batches.default_throughput,
+    let config = state.current_config();
+    let input = CapacityReservationInput {
         completion_window,
+        file_model_counts,
+        model_throughputs,
+        model_ids_by_alias,
+        default_throughput: config.batches.default_throughput,
         relaxation_factor,
-    );
+        reservation_ttl_secs: config.batches.reservation_ttl_secs,
+    };
 
-    if !capacity_result.has_capacity {
-        tx.rollback().await.ok();
-
-        let overloaded_details: Vec<String> = capacity_result
-            .overloaded_models
-            .iter()
-            .map(|(model, deficit)| format!("{} (needs {} more capacity)", model, deficit))
-            .collect();
-        tracing::warn!(
-            completion_window = %completion_window,
-            overloaded_models = %overloaded_details.join(", "),
-            "Batch rejected due to insufficient capacity"
-        );
-
-        let model_names: Vec<&str> = capacity_result.overloaded_models.keys().map(|model| model.as_str()).collect();
-
-        return Err(Error::TooManyRequests {
+    // Use the write pool for the reservation transaction
+    let pool = state.db.write();
+    reserve_capacity(pool, &*state.request_manager, &input).await.map_err(|e| match e {
+        CapacityError::InsufficientCapacity { completion_window, models } => Error::TooManyRequests {
             message: format!(
                 "Insufficient capacity for {} completion window. The following models are currently at capacity: {}. Try again later or use a longer completion window.",
-                completion_window,
-                model_names.join(", ")
+                completion_window, models
             ),
-        });
-    }
-
-    let expires_at = Utc::now() + Duration::seconds(state.config.batches.reservation_ttl_secs);
-
-    let mut rows = Vec::new();
-    for (alias, model_id) in &model_pairs {
-        if let Some(&count) = file_model_counts.get(alias)
-            && count > 0
-        {
-            rows.push((*model_id, completion_window, count, expires_at));
-        }
-    }
-
-    let reservation_ids = reservations.insert_reservations(&rows).await.map_err(|e| Error::Internal {
-        operation: format!("insert reservations: {}", e),
-    })?;
-
-    tx.commit().await.map_err(|e| Error::Internal {
-        operation: format!("commit reservation transaction: {}", e),
-    })?;
-
-    Ok(reservation_ids)
+        },
+        CapacityError::Internal(msg) => Error::Internal { operation: msg },
+    })
 }
 
 async fn release_capacity_reservations<P: PoolProvider>(state: &AppState<P>, reservation_ids: &[Uuid]) -> Result<()> {
-    use crate::db::handlers::BatchCapacityReservations;
-
-    if reservation_ids.is_empty() {
-        return Ok(());
-    }
-
-    let mut conn = state.db.write().acquire().await.map_err(|e| Error::Internal {
-        operation: format!("get db connection: {}", e),
-    })?;
-
-    let mut reservations = BatchCapacityReservations::new(&mut conn);
-    reservations
-        .release_reservations(reservation_ids)
+    super::sla_capacity::release_reservations(state.db.write(), reservation_ids)
         .await
-        .map_err(|e| Error::Internal {
-            operation: format!("release reservations: {}", e),
-        })
+        .map_err(|msg| Error::Internal { operation: msg })
 }
 
 #[utoipa::path(
@@ -695,16 +877,122 @@ pub async fn get_batch<P: PoolProvider>(
 
     // Check ownership: users without ReadAll permission can only see their own batches (or org batches)
     let can_read_all = can_read_all_resources(&current_user, Resource::Batches);
-    if !can_read_all && !is_batch_owner(&current_user, batch.created_by.as_deref()) {
+    if !can_read_all && !is_batch_owner(&current_user, &batch.created_by) {
         return Err(Error::NotFound {
             resource: "Batch".to_string(),
             id: batch_id_str,
         });
     }
 
-    // Fetch creator email for the response
-    let creator_email = fetch_creator_email(state.db.read(), &batch).await;
-    Ok(Json(to_batch_response_with_email(batch, creator_email.as_deref())))
+    // Enrich with creator/context metadata (same as list_batches)
+    let mut read_conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
+
+    // Resolve individual creator email via api_key_id
+    let created_by_email = if let Some(api_key_id) = batch.api_key_id {
+        let creator_map = ApiKeys::new(&mut read_conn)
+            .get_creators_by_key_ids(vec![api_key_id])
+            .await
+            .map_err(Error::Database)?;
+        if let Some(&creator_id) = creator_map.get(&api_key_id) {
+            Users::new(&mut read_conn)
+                .get_bulk(vec![creator_id])
+                .await
+                .map_err(|e| Error::Internal {
+                    operation: format!("fetch creator user: {}", e),
+                })?
+                .get(&creator_id)
+                .map(|u| u.email.clone())
+        } else {
+            None
+        }
+    } else {
+        // Fall back to owner email (legacy batches without api_key_id)
+        if let Ok(user_id) = Uuid::parse_str(&batch.created_by) {
+            Users::new(&mut read_conn)
+                .get_bulk(vec![user_id])
+                .await
+                .map_err(|e| Error::Internal {
+                    operation: format!("fetch owner user: {}", e),
+                })?
+                .get(&user_id)
+                .map(|u| u.email.clone())
+        } else {
+            None
+        }
+    };
+
+    // Resolve context from batch owner (created_by field)
+    let (context_name, context_type) = if let Ok(owner_id) = Uuid::parse_str(&batch.created_by) {
+        let user_map = Users::new(&mut read_conn)
+            .get_bulk(vec![owner_id])
+            .await
+            .map_err(|e| Error::Internal {
+                operation: format!("fetch owner user: {}", e),
+            })?;
+        match user_map.get(&owner_id) {
+            Some(u) if u.user_type == "organization" => {
+                let name = u.display_name.clone().unwrap_or_else(|| u.email.clone());
+                (Some(name), Some("organization".to_string()))
+            }
+            Some(_) => (Some("Personal".to_string()), Some("personal".to_string())),
+            None => (None, None),
+        }
+    } else {
+        (None, None)
+    };
+
+    // Resolve source connection name — only for sync-created batches, scoped to batch owner
+    let is_sync = batch
+        .metadata
+        .as_ref()
+        .and_then(|m| m.get("request_source"))
+        .and_then(|v| v.as_str())
+        == Some("sync");
+    let source_name = if is_sync {
+        if let Some(conn_id) = batch
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("dw_source_id"))
+            .and_then(|v| v.as_str())
+            .and_then(|s| Uuid::parse_str(s).ok())
+        {
+            match Connections::new(&mut read_conn).get_by_id(conn_id).await {
+                Ok(Some(conn)) if Uuid::parse_str(&batch.created_by).is_ok_and(|owner| conn.user_id == owner) => Some(conn.name),
+                Ok(_) => None, // Connection not found or not owned by batch owner
+                Err(e) => {
+                    tracing::warn!(error = %e, connection_id = %conn_id, "Failed to look up connection name");
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let mut response = to_batch_response_enriched(batch, None, source_name.as_deref());
+
+    if let Some(email) = created_by_email {
+        response
+            .metadata
+            .get_or_insert_with(HashMap::new)
+            .insert("created_by_email".to_string(), email);
+    }
+    if let Some(name) = context_name {
+        response
+            .metadata
+            .get_or_insert_with(HashMap::new)
+            .insert("context_name".to_string(), name);
+    }
+    if let Some(ctype) = context_type {
+        response
+            .metadata
+            .get_or_insert_with(HashMap::new)
+            .insert("context_type".to_string(), ctype);
+    }
+
+    Ok(Json(response))
 }
 
 #[utoipa::path(
@@ -745,7 +1033,7 @@ pub async fn get_batch_analytics<P: PoolProvider>(
 
     // Check ownership: users without ReadAll permission can only see their own batches (or org batches)
     let can_read_all = can_read_all_resources(&current_user, Resource::Batches);
-    if !can_read_all && !is_batch_owner(&current_user, batch.created_by.as_deref()) {
+    if !can_read_all && !is_batch_owner(&current_user, &batch.created_by) {
         return Err(Error::NotFound {
             resource: "Batch".to_string(),
             id: batch_id_str.clone(),
@@ -805,7 +1093,7 @@ pub async fn get_batch_results<P: PoolProvider>(
 
     // Check ownership: users without ReadAll permission can only see their own batches (or org batches)
     let can_read_all = can_read_all_resources(&current_user, Resource::Batches);
-    if !can_read_all && !is_batch_owner(&current_user, batch.created_by.as_deref()) {
+    if !can_read_all && !is_batch_owner(&current_user, &batch.created_by) {
         return Err(Error::NotFound {
             resource: "Batch".to_string(),
             id: batch_id_str.clone(),
@@ -961,7 +1249,7 @@ pub async fn cancel_batch<P: PoolProvider>(
 
     // Check ownership: users without UpdateAll permission can only cancel their own batches (or org batches)
     let can_update_all = has_permission(&current_user, Resource::Batches, Operation::UpdateAll);
-    if !can_update_all && !is_batch_owner(&current_user, batch.created_by.as_deref()) {
+    if !can_update_all && !is_batch_owner(&current_user, &batch.created_by) {
         return Err(Error::NotFound {
             resource: "Batch".to_string(),
             id: batch_id_str.clone(),
@@ -976,6 +1264,9 @@ pub async fn cancel_batch<P: PoolProvider>(
         .map_err(|e| Error::Internal {
             operation: format!("cancel batch: {}", e),
         })?;
+
+    // Enqueue background cleanup of child request states
+    enqueue_cascade_batch_state(&state, batch_id, CascadeTarget::Canceled).await;
 
     // Fetch updated batch to get latest status
     let batch = state
@@ -1034,14 +1325,14 @@ pub async fn delete_batch<P: PoolProvider>(
 
     // Check ownership: users without DeleteAll permission can only delete their own batches (or org batches)
     let can_delete_all = has_permission(&current_user, Resource::Batches, Operation::DeleteAll);
-    if !can_delete_all && !is_batch_owner(&current_user, batch.created_by.as_deref()) {
+    if !can_delete_all && !is_batch_owner(&current_user, &batch.created_by) {
         return Err(Error::NotFound {
             resource: "Batch".to_string(),
             id: batch_id_str.clone(),
         });
     }
 
-    // Delete the batch
+    // Delete the batch (also sets cancelling_at/cancelled_at if not already terminal)
     state
         .request_manager
         .delete_batch(fusillade::BatchId(batch_id))
@@ -1049,6 +1340,9 @@ pub async fn delete_batch<P: PoolProvider>(
         .map_err(|e| Error::Internal {
             operation: format!("delete batch: {}", e),
         })?;
+
+    // Enqueue background cleanup of child request states
+    enqueue_cascade_batch_state(&state, batch_id, CascadeTarget::Canceled).await;
 
     tracing::debug!("Batch {} deleted", batch_id);
 
@@ -1095,7 +1389,7 @@ pub async fn retry_failed_batch_requests<P: PoolProvider>(
 
     // Check ownership: users without UpdateAll permission can only retry their own batches (or org batches)
     let can_update_all = has_permission(&current_user, Resource::Batches, Operation::UpdateAll);
-    if !can_update_all && !is_batch_owner(&current_user, batch.created_by.as_deref()) {
+    if !can_update_all && !is_batch_owner(&current_user, &batch.created_by) {
         return Err(Error::NotFound {
             resource: "Batch".to_string(),
             id: batch_id_str.clone(),
@@ -1180,7 +1474,7 @@ pub async fn retry_specific_requests<P: PoolProvider>(
 
     // Check ownership: users without UpdateAll permission can only retry their own batches (or org batches)
     let can_update_all = has_permission(&current_user, Resource::Batches, Operation::UpdateAll);
-    if !can_update_all && !is_batch_owner(&current_user, batch.created_by.as_deref()) {
+    if !can_update_all && !is_batch_owner(&current_user, &batch.created_by) {
         return Err(Error::NotFound {
             resource: "Batch".to_string(),
             id: batch_id_str.clone(),
@@ -1283,20 +1577,82 @@ pub async fn list_batches<P: PoolProvider>(
         .as_ref()
         .and_then(|after_str| Uuid::parse_str(after_str).ok().map(fusillade::BatchId));
 
-    // Determine if user can read all batches or just their own
-    // In org context, show batches owned by the org instead of the individual user
+    // Determine ownership scoping:
+    // - Org context: always scope to org (unified view for both PMs and standard users)
+    // - Personal context + PM: no filter (sees all batches across all users)
+    // - Personal context + standard user: scope to own batches only
     let can_read_all = can_read_all_resources(&current_user, Resource::Batches);
-    let created_by = if can_read_all {
+    let created_by = if let Some(org_id) = current_user.active_organization {
+        Some(org_id.to_string())
+    } else if can_read_all {
         None
     } else {
-        let target_user_id = current_user.active_organization.unwrap_or(current_user.id);
-        Some(target_user_id.to_string())
+        Some(current_user.id.to_string())
     };
+
+    // Translate member_id to api_key_ids for fusillade filtering.
+    // Uses a short-lived connection so we don't hold it across the fusillade call.
+    //
+    // Note: this only matches batches created after hidden key attribution was deployed.
+    // Legacy batches with api_key_id = NULL won't match the filter.
+    let api_key_ids_filter = if let Some(member_id) = query.member_id {
+        let mut read_conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
+        let key_ids = match current_user.active_organization {
+            Some(org_id) => {
+                // Org context: find the single hidden key for this member in this org
+                let key_id = ApiKeys::new(&mut read_conn)
+                    .find_hidden_key_id(org_id, ApiKeyPurpose::Batch, member_id)
+                    .await
+                    .map_err(Error::Database)?;
+                key_id.into_iter().collect::<Vec<_>>()
+            }
+            None if can_read_all => {
+                // PM personal context: find ALL hidden keys created by this member
+                ApiKeys::new(&mut read_conn)
+                    .find_all_hidden_key_ids_by_creator(ApiKeyPurpose::Batch, member_id)
+                    .await
+                    .map_err(Error::Database)?
+            }
+            None => {
+                return Err(Error::BadRequest {
+                    message: "member_id filter is only available in organization context or for platform managers".to_string(),
+                });
+            }
+        };
+        if key_ids.is_empty() {
+            return Ok(Json(BatchListResponse {
+                object_type: ListObjectType::List,
+                data: vec![],
+                first_id: None,
+                last_id: None,
+                has_more: false,
+            }));
+        }
+        Some(key_ids)
+    } else {
+        None
+    };
+
+    // Parse the comma-separated `completion_window` filter into the list
+    // passed to fusillade. An empty/whitespace-only param is treated as "no
+    // filter" so callers can send `completion_window=` to disable the default.
+    let completion_windows = parse_completion_window_filter(query.completion_window.as_deref());
 
     // Fetch batches with ownership filtering, search, and cursor-based pagination
     let batches = state
         .request_manager
-        .list_batches(created_by, query.search.clone(), after, limit + 1) // Fetch one extra to determine has_more
+        .list_batches(fusillade::ListBatchesFilter {
+            created_by,
+            search: query.search.clone(),
+            after,
+            limit: Some(limit + 1),
+            api_key_ids: api_key_ids_filter,
+            status: query.status.clone(),
+            created_after: query.created_after,
+            created_before: query.created_before,
+            active_first: query.active_first,
+            completion_windows,
+        })
         .await
         .map_err(|e| Error::Internal {
             operation: format!("list batches: {}", e),
@@ -1310,24 +1666,50 @@ pub async fn list_batches<P: PoolProvider>(
     let first_id = batches.first().map(|b| b.id.0.to_string());
     let last_id = batches.last().map(|b| b.id.0.to_string());
 
-    // Collect unique created_by user IDs from batches
-    let user_ids: Vec<Uuid> = batches
+    // Resolve creator/context metadata for all returned batches.
+    // Uses a fresh connection (not held across the fusillade call above).
+    use crate::db::models::users::UserDBResponse;
+    let mut read_conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
+
+    // Resolve individual creators via api_key_id → api_keys.created_by
+    let api_key_ids: Vec<Uuid> = batches
         .iter()
-        .filter_map(|b| b.created_by.as_ref())
-        .filter_map(|id| Uuid::parse_str(id).ok())
+        .filter_map(|b| b.api_key_id)
         .collect::<std::collections::HashSet<_>>()
         .into_iter()
         .collect();
+    let api_key_creator_map: HashMap<Uuid, Uuid> = if !api_key_ids.is_empty() {
+        ApiKeys::new(&mut read_conn)
+            .get_creators_by_key_ids(api_key_ids)
+            .await
+            .map_err(Error::Database)?
+    } else {
+        HashMap::new()
+    };
 
-    // Bulk fetch user emails
-    let email_map: HashMap<String, String> = if !user_ids.is_empty() {
-        let mut conn = state.db.read().acquire().await.map_err(|e| Error::Internal {
-            operation: format!("acquire db connection: {}", e),
-        })?;
-        let users = Users::new(&mut conn).get_bulk(user_ids).await.map_err(|e| Error::Internal {
-            operation: format!("fetch users: {}", e),
-        })?;
-        users.into_iter().map(|(id, user)| (id.to_string(), user.email)).collect()
+    // Collect all unique user IDs we need to resolve:
+    // - Owner IDs from batch.created_by (could be org or personal user)
+    // - Individual creator IDs from api_key resolution
+    let mut all_user_ids: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
+    for batch in &batches {
+        if let Ok(owner_id) = Uuid::parse_str(&batch.created_by) {
+            all_user_ids.insert(owner_id);
+        }
+        if let Some(api_key_id) = batch.api_key_id
+            && let Some(&creator_id) = api_key_creator_map.get(&api_key_id)
+        {
+            all_user_ids.insert(creator_id);
+        }
+    }
+
+    // Bulk fetch all users (emails, user_type, display_name)
+    let user_map: HashMap<Uuid, UserDBResponse> = if !all_user_ids.is_empty() {
+        Users::new(&mut read_conn)
+            .get_bulk(all_user_ids.into_iter().collect())
+            .await
+            .map_err(|e| Error::Internal {
+                operation: format!("fetch users: {}", e),
+            })?
     } else {
         HashMap::new()
     };
@@ -1343,6 +1725,30 @@ pub async fn list_batches<P: PoolProvider>(
     // Collect batch IDs for bulk operations
     let batch_ids: Vec<Uuid> = batches.iter().map(|b| b.id.0).collect();
 
+    // Bulk fetch connection names for sync-created batches only, scoped to batch owners.
+    // Only consider batches where request_source == "sync" to prevent metadata injection.
+    let source_conn_ids: Vec<Uuid> = batches
+        .iter()
+        .filter(|b| b.metadata.as_ref().and_then(|m| m.get("request_source")).and_then(|v| v.as_str()) == Some("sync"))
+        .filter_map(|b| {
+            b.metadata
+                .as_ref()
+                .and_then(|m| m.get("dw_source_id"))
+                .and_then(|v| v.as_str())
+                .and_then(|s| Uuid::parse_str(s).ok())
+        })
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+    let connection_info: HashMap<Uuid, (String, Uuid)> = if !source_conn_ids.is_empty() {
+        Connections::new(&mut read_conn)
+            .get_names_by_ids(&source_conn_ids)
+            .await
+            .map_err(Error::Database)?
+    } else {
+        HashMap::new()
+    };
+
     // Fetch analytics in bulk if requested
     let analytics_map: HashMap<Uuid, BatchAnalytics> = if include_analytics && !batches.is_empty() {
         crate::db::handlers::analytics::get_batches_analytics_bulk(state.db.read(), &batch_ids)
@@ -1354,13 +1760,88 @@ pub async fn list_batches<P: PoolProvider>(
         HashMap::new()
     };
 
-    // Convert batches to responses with email injection and optional analytics
+    // Convert batches to responses with enriched creator/context metadata
     let data: Vec<_> = batches
         .into_iter()
         .map(|batch| {
-            let batch_id = batch.id; // Capture UUID before the move
-            let email = batch.created_by.as_ref().and_then(|id| email_map.get(id)).map(|s| s.as_str());
-            let mut response = to_batch_response_with_email(batch, email);
+            let batch_id = batch.id;
+
+            // Resolve individual creator email via api_key_id, with fallback
+            // to batch owner for legacy batches without api_key_id
+            let individual_creator_id = batch.api_key_id.and_then(|key_id| api_key_creator_map.get(&key_id).copied());
+            let created_by_email = individual_creator_id
+                .and_then(|uid| user_map.get(&uid))
+                .map(|u| u.email.clone())
+                .or_else(|| {
+                    // Legacy fallback: use batch owner (created_by) when api_key_id is NULL
+                    if batch.api_key_id.is_none() {
+                        Uuid::parse_str(&batch.created_by)
+                            .ok()
+                            .and_then(|uid| user_map.get(&uid))
+                            .map(|u| u.email.clone())
+                    } else {
+                        None
+                    }
+                });
+
+            // Resolve context from batch owner (created_by field)
+            let owner_id = Uuid::parse_str(&batch.created_by).ok();
+            let owner = owner_id.and_then(|id| user_map.get(&id));
+            let (context_name, context_type) = match owner {
+                Some(u) if u.user_type == "organization" => {
+                    let name = u.display_name.clone().unwrap_or_else(|| u.email.clone());
+                    (Some(name), Some("organization".to_string()))
+                }
+                Some(_) => (Some("Personal".to_string()), Some("personal".to_string())),
+                None => (None, None),
+            };
+
+            // Resolve source connection name — only for sync-created batches
+            let is_sync = batch
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("request_source"))
+                .and_then(|v| v.as_str())
+                == Some("sync");
+            let source_name: Option<&str> = if is_sync {
+                batch
+                    .metadata
+                    .as_ref()
+                    .and_then(|m| m.get("dw_source_id"))
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| Uuid::parse_str(s).ok())
+                    .and_then(|conn_id| {
+                        // Verify connection is owned by the batch creator
+                        let batch_owner = Uuid::parse_str(&batch.created_by).ok()?;
+                        let (name, owner) = connection_info.get(&conn_id)?;
+                        if *owner == batch_owner { Some(name.as_str()) } else { None }
+                    })
+            } else {
+                None
+            };
+
+            let mut response = to_batch_response_enriched(batch, None, source_name);
+
+            // Inject enriched creator/context info into metadata
+            if let Some(email) = created_by_email {
+                response
+                    .metadata
+                    .get_or_insert_with(HashMap::new)
+                    .insert("created_by_email".to_string(), email);
+            }
+            if let Some(name) = context_name {
+                response
+                    .metadata
+                    .get_or_insert_with(HashMap::new)
+                    .insert("context_name".to_string(), name);
+            }
+            if let Some(ctype) = context_type {
+                response
+                    .metadata
+                    .get_or_insert_with(HashMap::new)
+                    .insert("context_type".to_string(), ctype);
+            }
+
             if include_analytics {
                 response.analytics = analytics_map.get(&batch_id).cloned();
             }
@@ -1379,6 +1860,7 @@ pub async fn list_batches<P: PoolProvider>(
 
 #[cfg(test)]
 mod tests {
+    use super::parse_completion_window_filter;
     use crate::api::models::batches::CreateBatchRequest;
     use crate::api::models::users::Role;
     use crate::db::handlers::Credits;
@@ -1386,10 +1868,51 @@ mod tests {
     use crate::errors::Error;
     use crate::test::utils::*;
     use axum::http::StatusCode;
+    use fusillade::Storage;
     use rust_decimal::Decimal;
     use sqlx::PgPool;
     use std::collections::HashMap;
     use uuid::Uuid;
+
+    // -------------------------------------------------------------------------
+    // parse_completion_window_filter — pure parsing, no DB needed.
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn parse_completion_window_filter_returns_none_when_param_missing() {
+        assert_eq!(parse_completion_window_filter(None), None);
+    }
+
+    #[test]
+    fn parse_completion_window_filter_returns_none_when_param_empty() {
+        assert_eq!(parse_completion_window_filter(Some("")), None);
+    }
+
+    #[test]
+    fn parse_completion_window_filter_returns_none_when_param_whitespace_only() {
+        assert_eq!(parse_completion_window_filter(Some("   \t  ")), None);
+    }
+
+    #[test]
+    fn parse_completion_window_filter_parses_single_value() {
+        assert_eq!(parse_completion_window_filter(Some("24h")), Some(vec!["24h".to_string()]));
+    }
+
+    #[test]
+    fn parse_completion_window_filter_parses_comma_separated_values() {
+        assert_eq!(
+            parse_completion_window_filter(Some("24h,1h")),
+            Some(vec!["24h".to_string(), "1h".to_string()])
+        );
+    }
+
+    #[test]
+    fn parse_completion_window_filter_trims_and_drops_empty_entries() {
+        assert_eq!(
+            parse_completion_window_filter(Some(" 24h , , 1h ,   ")),
+            Some(vec!["24h".to_string(), "1h".to_string()])
+        );
+    }
 
     #[sqlx::test]
     #[test_log::test]
@@ -2342,23 +2865,10 @@ mod tests {
         let model_throughputs = HashMap::from([(alias.clone(), 1000.0_f32)]);
         let model_ids_by_alias = HashMap::from([(alias.clone(), model_id)]);
 
-        let windows = vec![("24h".to_string(), super::parse_window_to_seconds("24h"))];
-        let states = vec!["pending".to_string(), "claimed".to_string(), "processing".to_string()];
-        let model_filter = vec![alias.clone()];
-
-        let reservation_ids = super::reserve_capacity_for_batch(
-            &state,
-            "24h",
-            &file_model_counts,
-            &model_throughputs,
-            &model_ids_by_alias,
-            &windows,
-            &states,
-            &model_filter,
-            1.0,
-        )
-        .await
-        .unwrap();
+        let reservation_ids =
+            super::reserve_capacity_for_batch(&state, "24h", &file_model_counts, &model_throughputs, &model_ids_by_alias, 1.0)
+                .await
+                .unwrap();
 
         assert_eq!(reservation_ids.len(), 1);
 
@@ -2404,23 +2914,9 @@ mod tests {
         let model_throughputs = HashMap::from([(alias.clone(), 0.0_f32)]);
         let model_ids_by_alias = HashMap::from([(alias.clone(), model_id)]);
 
-        let windows = vec![("1h".to_string(), super::parse_window_to_seconds("1h"))];
-        let states = vec!["pending".to_string(), "claimed".to_string(), "processing".to_string()];
-        let model_filter = vec![alias.clone()];
-
-        let err = super::reserve_capacity_for_batch(
-            &state,
-            "1h",
-            &file_model_counts,
-            &model_throughputs,
-            &model_ids_by_alias,
-            &windows,
-            &states,
-            &model_filter,
-            1.0,
-        )
-        .await
-        .unwrap_err();
+        let err = super::reserve_capacity_for_batch(&state, "1h", &file_model_counts, &model_throughputs, &model_ids_by_alias, 1.0)
+            .await
+            .unwrap_err();
 
         match err {
             Error::TooManyRequests { .. } => {}
@@ -2641,6 +3137,56 @@ mod tests {
         assert!(error_text.contains("Unsupported completion_window"));
     }
 
+    /// Test that PlatformManager can use completion windows not in the allowed list
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_platform_manager_can_use_any_completion_window(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::PlatformManager]).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+
+        let deployment = create_test_deployment(&pool, user.id, "gpt-4-model", "gpt-4").await;
+        add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
+
+        let jsonl_content = r#"{"custom_id":"request-1","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}}"#;
+        let file_part = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("test-batch.jsonl");
+        let multipart = axum_test::multipart::MultipartForm::new()
+            .add_part("file", file_part)
+            .add_part("purpose", axum_test::multipart::Part::text("batch"));
+        let upload_resp = app
+            .post("/ai/v1/files")
+            .multipart(multipart)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+        upload_resp.assert_status(StatusCode::CREATED);
+        let file: serde_json::Value = upload_resp.json();
+        let file_id = file["id"].as_str().unwrap();
+
+        // "0s" is not in allowed_completion_windows but PlatformManager should bypass
+        let create_req = CreateBatchRequest {
+            input_file_id: file_id.to_string(),
+            endpoint: "/v1/chat/completions".to_string(),
+            completion_window: "0s".to_string(),
+            metadata: None,
+        };
+
+        let resp = app
+            .post("/ai/v1/batches")
+            .json(&create_req)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+        // Should not get 400 for unsupported completion_window
+        assert_ne!(
+            resp.status_code(),
+            StatusCode::BAD_REQUEST,
+            "PlatformManager should be able to use arbitrary completion windows, got: {}",
+            resp.text()
+        );
+    }
+
     /// Test that relaxation factor of 0.0 blocks all batches for that window
     #[sqlx::test]
     #[test_log::test]
@@ -2715,43 +3261,21 @@ mod tests {
         let file_model_counts = HashMap::from([(alias.clone(), 5_i64)]);
         let model_throughputs = HashMap::from([(alias.clone(), 0.001_f32)]);
         let model_ids_by_alias = HashMap::from([(alias.clone(), model_id)]);
-        let windows = vec![("1h".to_string(), super::parse_window_to_seconds("1h"))];
-        let states = vec!["pending".to_string(), "claimed".to_string(), "processing".to_string()];
-        let model_filter = vec![alias.clone()];
 
         // Without relaxation (strict): should be rejected
-        let strict_err = super::reserve_capacity_for_batch(
-            &state,
-            "1h",
-            &file_model_counts,
-            &model_throughputs,
-            &model_ids_by_alias,
-            &windows,
-            &states,
-            &model_filter,
-            1.0,
-        )
-        .await
-        .unwrap_err();
+        let strict_err = super::reserve_capacity_for_batch(&state, "1h", &file_model_counts, &model_throughputs, &model_ids_by_alias, 1.0)
+            .await
+            .unwrap_err();
         assert!(
             matches!(strict_err, Error::TooManyRequests { .. }),
             "Should be rejected at strict capacity"
         );
 
         // With relaxation factor 2.0: should be accepted
-        let reservation_ids = super::reserve_capacity_for_batch(
-            &state,
-            "1h",
-            &file_model_counts,
-            &model_throughputs,
-            &model_ids_by_alias,
-            &windows,
-            &states,
-            &model_filter,
-            2.0,
-        )
-        .await
-        .expect("Should be accepted with 2× relaxation factor");
+        let reservation_ids =
+            super::reserve_capacity_for_batch(&state, "1h", &file_model_counts, &model_throughputs, &model_ids_by_alias, 2.0)
+                .await
+                .expect("Should be accepted with 2× relaxation factor");
         assert_eq!(reservation_ids.len(), 1);
 
         super::release_capacity_reservations(&state, &reservation_ids).await.unwrap();
@@ -2778,41 +3302,18 @@ mod tests {
         let file_model_counts = HashMap::from([(alias.clone(), 5_i64)]);
         let model_throughputs = HashMap::from([(alias.clone(), 0.001_f32)]);
         let model_ids_by_alias = HashMap::from([(alias.clone(), model_id)]);
-        let states = vec!["pending".to_string(), "claimed".to_string(), "processing".to_string()];
-        let model_filter = vec![alias.clone()];
 
         // 1h window — strict (factor defaults to 1.0), 5 > 3.6, rejected
-        let windows_1h = vec![("1h".to_string(), super::parse_window_to_seconds("1h"))];
-        let err = super::reserve_capacity_for_batch(
-            &state,
-            "1h",
-            &file_model_counts,
-            &model_throughputs,
-            &model_ids_by_alias,
-            &windows_1h,
-            &states,
-            &model_filter,
-            1.0,
-        )
-        .await
-        .unwrap_err();
+        let err = super::reserve_capacity_for_batch(&state, "1h", &file_model_counts, &model_throughputs, &model_ids_by_alias, 1.0)
+            .await
+            .unwrap_err();
         assert!(matches!(err, Error::TooManyRequests { .. }), "1h should be rejected — not relaxed");
 
         // 24h window — factor=10.0, effective capacity = 86400 * 0.001 * 10 = 864, accepted
-        let windows_24h = vec![("24h".to_string(), super::parse_window_to_seconds("24h"))];
-        let reservation_ids = super::reserve_capacity_for_batch(
-            &state,
-            "24h",
-            &file_model_counts,
-            &model_throughputs,
-            &model_ids_by_alias,
-            &windows_24h,
-            &states,
-            &model_filter,
-            10.0,
-        )
-        .await
-        .expect("24h should be accepted with 10× relaxation");
+        let reservation_ids =
+            super::reserve_capacity_for_batch(&state, "24h", &file_model_counts, &model_throughputs, &model_ids_by_alias, 10.0)
+                .await
+                .expect("24h should be accepted with 10× relaxation");
         assert_eq!(reservation_ids.len(), 1);
 
         super::release_capacity_reservations(&state, &reservation_ids).await.unwrap();
@@ -2903,7 +3404,6 @@ mod tests {
             })
             .await
             .unwrap();
-        drop(credits_repo);
         drop(conn);
 
         let create_req = CreateBatchRequest {
@@ -2972,5 +3472,747 @@ mod tests {
 
         // Zero balance should be accepted (only negative is rejected)
         resp.assert_status(StatusCode::CREATED);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_create_batch_in_org_context_checks_org_balance_not_user(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+
+        // Create a user with negative personal balance
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let org = create_test_org(&pool, user.id).await;
+
+        let mut conn = pool.acquire().await.unwrap();
+        let mut credits_repo = Credits::new(&mut conn);
+
+        // Give user negative balance
+        credits_repo
+            .create_transaction(&CreditTransactionCreateDBRequest {
+                user_id: user.id,
+                transaction_type: CreditTransactionType::Usage,
+                amount: Decimal::new(500, 2), // -$5.00
+                source_id: Uuid::new_v4().to_string(),
+                description: Some("Usage".to_string()),
+                fusillade_batch_id: None,
+                api_key_id: None,
+            })
+            .await
+            .unwrap();
+
+        // Give org positive balance
+        credits_repo
+            .create_transaction(&CreditTransactionCreateDBRequest {
+                user_id: org.id,
+                transaction_type: CreditTransactionType::AdminGrant,
+                amount: Decimal::new(1000, 2), // $10.00
+                source_id: Uuid::new_v4().to_string(),
+                description: Some("Org credits".to_string()),
+                fusillade_batch_id: None,
+                api_key_id: None,
+            })
+            .await
+            .unwrap();
+        drop(conn);
+
+        // Give org access to a model
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, org.id, group.id).await;
+        let deployment = create_test_deployment(&pool, user.id, "gpt-4-model", "gpt-4").await;
+        add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
+
+        let auth = add_auth_headers(&user);
+        let org_cookie = format!("dw_active_org={}", org.id);
+
+        // Upload a file in org context
+        let jsonl_content = r#"{"custom_id":"request-1","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}}"#;
+        let file_part = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("test-batch.jsonl");
+        let multipart = axum_test::multipart::MultipartForm::new()
+            .add_part("file", file_part)
+            .add_part("purpose", axum_test::multipart::Part::text("batch"));
+        let upload_resp = app
+            .post("/ai/v1/files")
+            .multipart(multipart)
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .add_header("cookie", &org_cookie)
+            .await;
+        upload_resp.assert_status(StatusCode::CREATED);
+        let file: serde_json::Value = upload_resp.json();
+        let file_id = file["id"].as_str().unwrap();
+
+        // Create batch in org context — should succeed despite user's negative balance
+        // because the org has positive balance
+        let create_req = CreateBatchRequest {
+            input_file_id: file_id.to_string(),
+            endpoint: "/v1/chat/completions".to_string(),
+            completion_window: "24h".to_string(),
+            metadata: None,
+        };
+
+        let resp = app
+            .post("/ai/v1/batches")
+            .json(&create_req)
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .add_header("cookie", &org_cookie)
+            .await;
+
+        resp.assert_status(StatusCode::CREATED);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_list_batches_member_id_rejected_outside_org_context(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let auth = add_auth_headers(&user);
+
+        // Attempt member_id filter without org context → should return 400
+        let resp = app
+            .get(&format!("/ai/v1/batches?member_id={}", Uuid::new_v4()))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await;
+        resp.assert_status(StatusCode::BAD_REQUEST);
+        let body = resp.text();
+        assert!(
+            body.contains("organization context"),
+            "Expected error about org context, got: {}",
+            body
+        );
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_list_batches_member_id_no_key_returns_empty(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let org = create_test_org(&pool, user.id).await;
+        let auth = add_auth_headers(&user);
+        let org_cookie = format!("dw_active_org={}", org.id);
+
+        // Filter by a member who has never created batches (no hidden key) → empty list
+        let unknown_member = Uuid::new_v4();
+        let resp = app
+            .get(&format!("/ai/v1/batches?member_id={}", unknown_member))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .add_header("cookie", &org_cookie)
+            .await;
+        resp.assert_status_ok();
+        let body: serde_json::Value = resp.json();
+        assert_eq!(body["data"].as_array().unwrap().len(), 0);
+        assert_eq!(body["has_more"], false);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_list_batches_enrichment_in_org_context(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let org = create_test_org(&pool, user.id).await;
+
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, org.id, group.id).await;
+        // Also add user directly so they have model access in personal context too
+        add_user_to_group(&pool, user.id, group.id).await;
+        let deployment = create_test_deployment(&pool, user.id, "gpt-4-model", "gpt-4").await;
+        add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
+
+        let auth = add_auth_headers(&user);
+        let org_cookie = format!("dw_active_org={}", org.id);
+
+        // Upload file and create batch in org context
+        let jsonl_content = r#"{"custom_id":"req-1","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}}"#;
+        let file_part = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("enrich-test.jsonl");
+        let multipart = axum_test::multipart::MultipartForm::new()
+            .add_part("file", file_part)
+            .add_part("purpose", axum_test::multipart::Part::text("batch"));
+        let upload_resp = app
+            .post("/ai/v1/files")
+            .multipart(multipart)
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .add_header("cookie", &org_cookie)
+            .await;
+        upload_resp.assert_status(StatusCode::CREATED);
+        let file: serde_json::Value = upload_resp.json();
+        let file_id = file["id"].as_str().unwrap();
+
+        let create_req = CreateBatchRequest {
+            input_file_id: file_id.to_string(),
+            endpoint: "/v1/chat/completions".to_string(),
+            completion_window: "24h".to_string(),
+            metadata: None,
+        };
+        let create_resp = app
+            .post("/ai/v1/batches")
+            .json(&create_req)
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .add_header("cookie", &org_cookie)
+            .await;
+        create_resp.assert_status(StatusCode::CREATED);
+
+        // List in org context → should have enriched metadata
+        let list_resp = app
+            .get("/ai/v1/batches")
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .add_header("cookie", &org_cookie)
+            .await;
+        list_resp.assert_status_ok();
+        let list_body: serde_json::Value = list_resp.json();
+        let batch = &list_body["data"][0];
+        let metadata = &batch["metadata"];
+        // Org context should see enriched fields
+        assert!(
+            metadata["created_by_email"].is_string(),
+            "Expected enriched created_by_email in org context"
+        );
+        assert!(
+            metadata["context_name"].is_string(),
+            "Expected enriched context_name in org context"
+        );
+
+        // Create a personal batch (no org context) so we can verify scrubbing
+        let personal_file_part = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("personal-test.jsonl");
+        let personal_multipart = axum_test::multipart::MultipartForm::new()
+            .add_part("file", personal_file_part)
+            .add_part("purpose", axum_test::multipart::Part::text("batch"));
+        let personal_upload_resp = app
+            .post("/ai/v1/files")
+            .multipart(personal_multipart)
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await;
+        personal_upload_resp.assert_status(StatusCode::CREATED);
+        let personal_file: serde_json::Value = personal_upload_resp.json();
+        let personal_file_id = personal_file["id"].as_str().unwrap();
+
+        let personal_batch_req = CreateBatchRequest {
+            input_file_id: personal_file_id.to_string(),
+            endpoint: "/v1/chat/completions".to_string(),
+            completion_window: "24h".to_string(),
+            metadata: None,
+        };
+        let personal_create_resp = app
+            .post("/ai/v1/batches")
+            .json(&personal_batch_req)
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await;
+        personal_create_resp.assert_status(StatusCode::CREATED);
+
+        // List outside org context → personal batch should also have enrichment
+        // (enrichment is always applied since authorization already controls visibility)
+        let list_resp_personal = app
+            .get("/ai/v1/batches")
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await;
+        list_resp_personal.assert_status_ok();
+        let list_body_personal: serde_json::Value = list_resp_personal.json();
+        let personal_batches = list_body_personal["data"].as_array().unwrap();
+        assert!(!personal_batches.is_empty(), "Expected at least one personal batch");
+        for batch in personal_batches {
+            let meta = batch["metadata"].as_object().expect("metadata should exist");
+            assert!(
+                meta.contains_key("created_by_email"),
+                "created_by_email should be present even in personal context"
+            );
+            assert!(
+                meta.contains_key("context_name"),
+                "context_name should be present even in personal context"
+            );
+            assert_eq!(
+                meta.get("context_type").and_then(|v| v.as_str()),
+                Some("personal"),
+                "personal batch should have context_type=personal"
+            );
+        }
+    }
+
+    /// Test that batch results correctly include reasoning tokens in response bodies
+    /// when the upstream model returns thinking/reasoning token usage.
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_batch_results_with_reasoning_tokens(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+
+        let deployment = create_test_deployment(&pool, user.id, "thinking-model-endpoint", "thinking-model").await;
+        add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
+
+        let file_id = Uuid::new_v4();
+        let batch_id = Uuid::new_v4();
+
+        sqlx::query(
+            "INSERT INTO fusillade.files (id, name, status, created_at, updated_at) VALUES ($1, 'thinking-test.jsonl', 'processed', NOW(), NOW())",
+        )
+        .bind(file_id)
+        .execute(&pool)
+        .await
+        .expect("Failed to create file");
+
+        sqlx::query(
+            "INSERT INTO fusillade.batches (id, created_by, file_id, endpoint, completion_window, expires_at, created_at, total_requests) VALUES ($1, $2, $3, '/v1/chat/completions', '24h', NOW() + interval '24 hours', NOW(), 3)",
+        )
+        .bind(batch_id)
+        .bind(user.id.to_string())
+        .bind(file_id)
+        .execute(&pool)
+        .await
+        .expect("Failed to create batch");
+
+        // Three requests with different reasoning token amounts
+        let thinking_responses = vec![
+            (
+                "req-think-1",
+                serde_json::json!({
+                    "id": "chatcmpl-think-1",
+                    "object": "chat.completion",
+                    "model": "thinking-model",
+                    "choices": [{"index": 0, "message": {"role": "assistant", "content": "The capital of France is Paris."}, "finish_reason": "stop"}],
+                    "usage": {
+                        "prompt_tokens": 22,
+                        "completion_tokens": 891,
+                        "total_tokens": 913,
+                        "completion_tokens_details": {
+                            "reasoning_tokens": 733,
+                            "audio_tokens": 0,
+                            "image_tokens": 0
+                        },
+                        "prompt_tokens_details": {
+                            "audio_tokens": 0,
+                            "cached_tokens": 0,
+                            "cache_write_tokens": 0,
+                            "video_tokens": 0
+                        }
+                    }
+                }),
+            ),
+            (
+                "req-think-2",
+                serde_json::json!({
+                    "id": "chatcmpl-think-2",
+                    "object": "chat.completion",
+                    "model": "thinking-model",
+                    "choices": [{"index": 0, "message": {"role": "assistant", "content": "Quantum entanglement is..."}, "finish_reason": "stop"}],
+                    "usage": {
+                        "prompt_tokens": 20,
+                        "completion_tokens": 2101,
+                        "total_tokens": 2121,
+                        "completion_tokens_details": {
+                            "reasoning_tokens": 1412,
+                            "audio_tokens": 0,
+                            "image_tokens": 0
+                        },
+                        "prompt_tokens_details": {
+                            "audio_tokens": 0,
+                            "cached_tokens": 0,
+                            "cache_write_tokens": 0,
+                            "video_tokens": 0
+                        }
+                    }
+                }),
+            ),
+            (
+                "req-think-3",
+                serde_json::json!({
+                    "id": "chatcmpl-think-3",
+                    "object": "chat.completion",
+                    "model": "thinking-model",
+                    "choices": [{"index": 0, "message": {"role": "assistant", "content": "The ocean is vast..."}, "finish_reason": "stop"}],
+                    "usage": {
+                        "prompt_tokens": 18,
+                        "completion_tokens": 1813,
+                        "total_tokens": 1831,
+                        "completion_tokens_details": {
+                            "reasoning_tokens": 1735,
+                            "audio_tokens": 0,
+                            "image_tokens": 0
+                        },
+                        "prompt_tokens_details": {
+                            "audio_tokens": 0,
+                            "cached_tokens": 0,
+                            "cache_write_tokens": 0,
+                            "video_tokens": 0
+                        }
+                    }
+                }),
+            ),
+        ];
+
+        for (custom_id, response_body) in &thinking_responses {
+            let template_id = Uuid::new_v4();
+            let request_id = Uuid::new_v4();
+            let body = serde_json::json!({"model": "thinking-model", "messages": [{"role": "user", "content": "Test"}], "thinking": {"type": "enabled", "budget_tokens": 4096}});
+
+            sqlx::query(
+                "INSERT INTO fusillade.request_templates (id, file_id, model, api_key, endpoint, path, body, custom_id, method) VALUES ($1, $2, 'thinking-model', 'test-key', 'http://test', '/v1/chat/completions', $3, $4, 'POST')",
+            )
+            .bind(template_id)
+            .bind(file_id)
+            .bind(serde_json::to_string(&body).unwrap())
+            .bind(*custom_id)
+            .execute(&pool)
+            .await
+            .expect("Failed to create template");
+
+            sqlx::query(
+                "INSERT INTO fusillade.requests (id, batch_id, template_id, model, state, response_status, response_body, created_at, completed_at) VALUES ($1, $2, $3, 'thinking-model', 'completed', 200, $4, NOW(), NOW())",
+            )
+            .bind(request_id)
+            .bind(batch_id)
+            .bind(template_id)
+            .bind(serde_json::to_string(response_body).unwrap())
+            .execute(&pool)
+            .await
+            .expect("Failed to create completed request");
+        }
+
+        let auth = add_auth_headers(&user);
+
+        // Fetch results and verify reasoning tokens are preserved in response bodies
+        let response = app
+            .get(&format!("/ai/v1/batches/{}/results", batch_id))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await;
+
+        response.assert_status(StatusCode::OK);
+        response.assert_header("content-type", "application/x-ndjson");
+        response.assert_header("X-Incomplete", "false");
+
+        let body = response.text();
+        let lines: Vec<&str> = body.trim().lines().collect();
+        assert_eq!(lines.len(), 3, "Should return all 3 thinking results");
+
+        let mut total_prompt = 0i64;
+        let mut total_completion = 0i64;
+        let mut total_reasoning = 0i64;
+        let mut total_tokens = 0i64;
+
+        for line in &lines {
+            let item: serde_json::Value = serde_json::from_str(line).expect("Each line should be valid JSON");
+            assert_eq!(item["status"].as_str().unwrap(), "completed");
+
+            let response_body = &item["response_body"];
+            let usage = &response_body["usage"];
+
+            // Verify usage fields exist
+            assert!(usage["prompt_tokens"].is_number(), "prompt_tokens should be present");
+            assert!(usage["completion_tokens"].is_number(), "completion_tokens should be present");
+            assert!(usage["total_tokens"].is_number(), "total_tokens should be present");
+
+            // Verify reasoning tokens in completion_tokens_details
+            let details = &usage["completion_tokens_details"];
+            assert!(
+                details["reasoning_tokens"].is_number(),
+                "reasoning_tokens should be present in completion_tokens_details"
+            );
+
+            let prompt = usage["prompt_tokens"].as_i64().unwrap();
+            let completion = usage["completion_tokens"].as_i64().unwrap();
+            let reasoning = details["reasoning_tokens"].as_i64().unwrap();
+            let total = usage["total_tokens"].as_i64().unwrap();
+
+            // Reasoning tokens should be a subset of completion tokens
+            assert!(
+                reasoning <= completion,
+                "reasoning_tokens ({}) should be <= completion_tokens ({})",
+                reasoning,
+                completion
+            );
+            // Total = prompt + completion (reasoning is subset, not additive)
+            assert_eq!(total, prompt + completion, "total_tokens should equal prompt + completion");
+
+            total_prompt += prompt;
+            total_completion += completion;
+            total_reasoning += reasoning;
+            total_tokens += total;
+        }
+
+        // Verify aggregate totals match expected values
+        assert_eq!(total_prompt, 60, "Total prompt tokens should be 60");
+        assert_eq!(total_completion, 4805, "Total completion tokens should be 4805");
+        assert_eq!(total_reasoning, 3880, "Total reasoning tokens should be 3880");
+        assert_eq!(total_tokens, 4865, "Total tokens should be 4865");
+    }
+
+    /// Test that batch analytics correctly aggregates reasoning tokens from http_analytics
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_batch_analytics_with_reasoning_tokens(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+
+        let deployment = create_test_deployment(&pool, user.id, "thinking-analytics-endpoint", "thinking-model").await;
+        add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
+
+        // Upload a batch file
+        let jsonl_content = r#"{"custom_id":"request-1","method":"POST","url":"/v1/chat/completions","body":{"model":"thinking-model","messages":[{"role":"user","content":"Hello"}],"thinking":{"type":"enabled","budget_tokens":4096}}}"#;
+        let file_part = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("thinking-test.jsonl");
+        let multipart = axum_test::multipart::MultipartForm::new()
+            .add_part("file", file_part)
+            .add_part("purpose", axum_test::multipart::Part::text("batch"));
+        let upload_resp = app
+            .post("/ai/v1/files")
+            .multipart(multipart)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+        upload_resp.assert_status(StatusCode::CREATED);
+        let file: serde_json::Value = upload_resp.json();
+        let file_id = file["id"].as_str().unwrap();
+
+        // Create batch
+        let create_req = CreateBatchRequest {
+            input_file_id: file_id.to_string(),
+            endpoint: "/v1/chat/completions".to_string(),
+            completion_window: "24h".to_string(),
+            metadata: None,
+        };
+
+        let create_resp = app
+            .post("/ai/v1/batches")
+            .json(&create_req)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+        create_resp.assert_status(StatusCode::CREATED);
+        let batch: serde_json::Value = create_resp.json();
+        let batch_id = batch["id"].as_str().unwrap();
+        let batch_uuid = Uuid::parse_str(batch_id).unwrap();
+
+        // Insert analytics rows with reasoning tokens directly into http_analytics
+        let analytics_data = vec![(22i64, 891i64, 733i64, 913i64), (20, 2101, 1412, 2121), (18, 1813, 1735, 1831)];
+
+        for (prompt, completion, reasoning, total) in &analytics_data {
+            sqlx::query!(
+                r#"
+                INSERT INTO http_analytics (
+                    instance_id, correlation_id, timestamp, uri, method, status_code,
+                    duration_ms, model, prompt_tokens, completion_tokens, reasoning_tokens,
+                    total_tokens, fusillade_batch_id
+                ) VALUES ($1, $2, NOW(), '/ai/v1/chat/completions', 'POST', 200,
+                    100, 'thinking-model', $3, $4, $5, $6, $7)
+                "#,
+                Uuid::new_v4(),
+                (rand::random::<u64>() >> 1) as i64,
+                prompt,
+                completion,
+                reasoning,
+                total,
+                batch_uuid,
+            )
+            .execute(&pool)
+            .await
+            .expect("Failed to insert analytics data");
+        }
+
+        let auth = add_auth_headers(&user);
+
+        // Fetch analytics and verify reasoning tokens are aggregated correctly
+        let analytics_resp = app
+            .get(&format!("/ai/v1/batches/{}/analytics", batch_id))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await;
+        analytics_resp.assert_status(StatusCode::OK);
+        let analytics: serde_json::Value = analytics_resp.json();
+
+        assert_eq!(
+            analytics["total_prompt_tokens"].as_i64().unwrap(),
+            60,
+            "Aggregated prompt tokens should be 60"
+        );
+        assert_eq!(
+            analytics["total_completion_tokens"].as_i64().unwrap(),
+            4805,
+            "Aggregated completion tokens should be 4805"
+        );
+        assert_eq!(
+            analytics["total_reasoning_tokens"].as_i64().unwrap(),
+            3880,
+            "Aggregated reasoning tokens should be 3880"
+        );
+        assert_eq!(
+            analytics["total_tokens"].as_i64().unwrap(),
+            4865,
+            "Aggregated total tokens should be 4865"
+        );
+        assert_eq!(analytics["total_requests"].as_i64().unwrap(), 3, "Should have 3 analytics records");
+
+        // Also verify via include=analytics on the list endpoint
+        let list_resp = app
+            .get("/ai/v1/batches?include=analytics")
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await;
+        list_resp.assert_status_ok();
+        let list_body: serde_json::Value = list_resp.json();
+        let batches = list_body["data"].as_array().unwrap();
+        let our_batch = batches
+            .iter()
+            .find(|b| b["id"].as_str().unwrap() == batch_id)
+            .expect("Our batch should be in the list");
+
+        let list_analytics = &our_batch["analytics"];
+        assert!(list_analytics.is_object(), "analytics should be present with include=analytics");
+        assert_eq!(
+            list_analytics["total_reasoning_tokens"].as_i64().unwrap(),
+            3880,
+            "Reasoning tokens should match in list analytics"
+        );
+    }
+
+    /// Helper: insert a batch with `n` pending requests directly into fusillade tables.
+    /// Returns (batch_id, request_ids).
+    async fn insert_batch_with_pending_requests(pool: &PgPool, user_id: Uuid, n: usize) -> (Uuid, Vec<Uuid>) {
+        let file_id = Uuid::new_v4();
+        let batch_id = Uuid::new_v4();
+
+        sqlx::query(
+            "INSERT INTO fusillade.files (id, name, status, created_at, updated_at) VALUES ($1, 'test.jsonl', 'processed', NOW(), NOW())",
+        )
+        .bind(file_id)
+        .execute(pool)
+        .await
+        .expect("insert file");
+
+        sqlx::query(
+            "INSERT INTO fusillade.batches (id, created_by, file_id, endpoint, completion_window, expires_at, created_at, total_requests) VALUES ($1, $2, $3, '/v1/chat/completions', '24h', NOW() + interval '24 hours', NOW(), $4)",
+        )
+        .bind(batch_id)
+        .bind(user_id.to_string())
+        .bind(file_id)
+        .bind(n as i32)
+        .execute(pool)
+        .await
+        .expect("insert batch");
+
+        let mut request_ids = Vec::new();
+        for i in 0..n {
+            let template_id = Uuid::new_v4();
+            let request_id = Uuid::new_v4();
+            let body = serde_json::json!({"model": "test-model", "messages": [{"role": "user", "content": format!("Test {}", i)}]});
+
+            sqlx::query(
+                "INSERT INTO fusillade.request_templates (id, file_id, model, api_key, endpoint, path, body, custom_id, method) VALUES ($1, $2, 'test-model', 'test-key', 'http://test', '/v1/chat/completions', $3, $4, 'POST')",
+            )
+            .bind(template_id)
+            .bind(file_id)
+            .bind(serde_json::to_string(&body).unwrap())
+            .bind(format!("req-{i}"))
+            .execute(pool)
+            .await
+            .expect("insert template");
+
+            sqlx::query(
+                "INSERT INTO fusillade.requests (id, batch_id, template_id, model, state, created_at) VALUES ($1, $2, $3, 'test-model', 'pending', NOW())",
+            )
+            .bind(request_id)
+            .bind(batch_id)
+            .bind(template_id)
+            .execute(pool)
+            .await
+            .expect("insert request");
+
+            request_ids.push(request_id);
+        }
+
+        (batch_id, request_ids)
+    }
+
+    /// Verify that cancel_batch + cascade_batch_state_to_requests transitions
+    /// pending child requests to canceled. We call the cascade function directly
+    /// rather than relying on the background worker — the enqueue wiring is
+    /// structural and visible in the handler code; testing the actual state
+    /// transition avoids the pool-contention issues that background workers
+    /// cause in CI's parallel test environment.
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_cancel_batch_cascades_state_to_child_requests(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let auth = add_auth_headers(&user);
+
+        let (batch_id, request_ids) = insert_batch_with_pending_requests(&pool, user.id, 5).await;
+
+        // Verify all start as pending
+        let pending_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*)::bigint FROM fusillade.requests WHERE id = ANY($1) AND state = 'pending'")
+                .bind(&request_ids)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(pending_count, 5, "all requests should start as pending");
+
+        // Cancel the batch via the API (enqueues the cascade job)
+        let resp = app
+            .post(&format!("/ai/v1/batches/{batch_id}/cancel"))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await;
+        resp.assert_status_ok();
+
+        // Simulate what the background worker does: call cascade directly
+        let updated = _bg_services
+            .request_manager
+            .cascade_batch_state_to_requests(fusillade::BatchId(batch_id), fusillade::CascadeTargetState::Canceled)
+            .await
+            .expect("cascade should succeed");
+        assert_eq!(updated, 5, "all 5 pending requests should be transitioned");
+
+        // Verify final state
+        let canceled_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*)::bigint FROM fusillade.requests WHERE id = ANY($1) AND state = 'canceled'")
+                .bind(&request_ids)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(canceled_count, 5, "all requests should now be canceled");
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_delete_batch_cascades_state_to_child_requests(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser, Role::PlatformManager]).await;
+        let auth = add_auth_headers(&user);
+
+        let (batch_id, request_ids) = insert_batch_with_pending_requests(&pool, user.id, 5).await;
+
+        // Delete the batch via the API (enqueues the cascade job)
+        let resp = app
+            .delete(&format!("/ai/v1/batches/{batch_id}"))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await;
+        resp.assert_status(StatusCode::NO_CONTENT);
+
+        // Simulate what the background worker does
+        let updated = _bg_services
+            .request_manager
+            .cascade_batch_state_to_requests(fusillade::BatchId(batch_id), fusillade::CascadeTargetState::Canceled)
+            .await
+            .expect("cascade should succeed");
+        assert_eq!(updated, 5);
+
+        let canceled_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*)::bigint FROM fusillade.requests WHERE id = ANY($1) AND state = 'canceled'")
+                .bind(&request_ids)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(canceled_count, 5, "all requests should now be canceled");
     }
 }

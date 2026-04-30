@@ -62,13 +62,14 @@ import {
 import { StatusRow } from "./StatusRow";
 import { Markdown } from "../../../ui/markdown";
 import { isBatchDenied, isPlaygroundDenied, isRealtimeDenied } from "../../../../utils/modelAccess";
+import { copyToClipboard } from "../../../../utils/clipboard";
 
 const COMPLETION_WINDOWS: Record<
   string,
   { label: string; icon: typeof Clock; sort: number }
 > = {
-  "1h": { label: "High", icon: Zap, sort: 0 },
-  "24h": { label: "Standard", icon: Clock, sort: 1 },
+  "1h": { label: "Async", icon: Zap, sort: 0 },
+  "24h": { label: "Batch", icon: Clock, sort: 1 },
 };
 
 const formatReleaseDate = (dateStr: string): string => {
@@ -86,12 +87,12 @@ const CopyableModelName: React.FC<{
     if (el) setTruncated(el.scrollWidth > el.clientWidth);
   }, []);
 
-  const handleCopy = (e: React.MouseEvent) => {
+  const handleCopy = async (e: React.MouseEvent) => {
     e.stopPropagation();
-    navigator.clipboard.writeText(alias).then(() => {
+    if (await copyToClipboard(alias)) {
       setCopied(true);
       setTimeout(() => setCopied(false), 1500);
-    });
+    }
   };
 
   const title = (
@@ -201,6 +202,8 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
     endpoint: endpointId,
     group: groupId,
     is_composite: isCompositeFilter,
+    sort: "released_at",
+    sort_direction: "desc",
   });
 
   // Load metrics lazily in the background so model cards render immediately
@@ -212,6 +215,8 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
     endpoint: endpointId,
     group: groupId,
     is_composite: isCompositeFilter,
+    sort: "released_at",
+    sort_direction: "desc",
     enabled: canViewAnalytics,
   });
 
@@ -960,6 +965,7 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
           setApiExamplesModel(null);
         }}
         model={apiExamplesModel}
+        defaultTab="realtime"
       />
 
     </>
