@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useParams, useNavigate } from "react-router-dom";
-import { ArrowLeft, Copy, Check, Play, Code } from "lucide-react";
+import { ArrowLeft, Copy, Check, Play, Code, Zap } from "lucide-react";
 import { useModel } from "../../../../api/control-layer";
 import type { Model } from "../../../../api/control-layer/types";
 import { Button } from "../../../ui/button";
@@ -10,11 +10,12 @@ import {
 } from "../../../ui/card";
 import { Markdown } from "../../../ui/markdown";
 import { ApiExamples } from "../../../modals";
-import { isPlaygroundDenied } from "../../../../utils/modelAccess";
+import { isBatchDenied, isPlaygroundDenied } from "../../../../utils/modelAccess";
+import { copyToClipboard } from "../../../../utils/clipboard";
 import {
   formatTariffPrice,
   getTariffDisplayName,
-  getUserFacingTariffs,
+  getVisibleTariffsForModel,
 } from "../../../../utils/formatters";
 import { IntelligenceBars } from "../IntelligenceIndicator";
 
@@ -25,8 +26,7 @@ const MODEL_TYPE_LABELS: Record<string, string> = {
 };
 
 function ModelPricing({ model }: { model: Model }) {
-  if (!model.tariffs) return null;
-  const tiers = getUserFacingTariffs(model.tariffs);
+  const tiers = getVisibleTariffsForModel(model);
   if (tiers.length === 0) return null;
 
   return (
@@ -88,6 +88,7 @@ export const ModelDetail: React.FC = () => {
   } = useModel(modelId!, { include: "pricing" });
 
   const playgroundAvailable = model ? !isPlaygroundDenied(model) : false;
+  const asyncAvailable = model ? !isBatchDenied(model) : false;
 
   if (isLoading) {
     return (
@@ -143,11 +144,11 @@ export const ModelDetail: React.FC = () => {
                     type="button"
                     className="shrink-0 p-1 text-gray-400 hover:text-gray-600 transition-colors"
                     aria-label="Copy model alias"
-                    onClick={() => {
-                      navigator.clipboard.writeText(model.alias).then(() => {
+                    onClick={async () => {
+                      if (await copyToClipboard(model.alias)) {
                         setAliasCopied(true);
                         setTimeout(() => setAliasCopied(false), 1500);
-                      });
+                      }
                     }}
                   >
                     {aliasCopied ? (
@@ -184,6 +185,20 @@ export const ModelDetail: React.FC = () => {
                   >
                     <Play className="h-4 w-4 mr-1" />
                     Try it
+                  </Button>
+                )}
+                {asyncAvailable && (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() =>
+                      navigate(
+                        `/responses?create=true&model=${encodeURIComponent(model.alias)}`,
+                      )
+                    }
+                  >
+                    <Zap className="h-4 w-4 mr-1" />
+                    Try Async
                   </Button>
                 )}
               </div>
@@ -269,6 +284,7 @@ export const ModelDetail: React.FC = () => {
         isOpen={showApiExamples}
         onClose={() => setShowApiExamples(false)}
         model={model}
+        defaultTab="realtime"
       />
     </div>
   );

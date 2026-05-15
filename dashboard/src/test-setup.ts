@@ -1,4 +1,27 @@
 import "@testing-library/jest-dom";
+import { afterEach } from "vitest";
+
+// Clear localStorage between tests so persisted UI filters
+// (see usePersistedFilter) don't leak across cases.
+afterEach(() => {
+  if (typeof localStorage !== "undefined") {
+    localStorage.clear();
+  }
+});
+
+// Polyfill matchMedia for useIsMobile hook
+if (typeof window !== "undefined" && !window.matchMedia) {
+  window.matchMedia = (query: string) => ({
+    matches: false,
+    media: query,
+    onchange: null,
+    addListener: () => {},
+    removeListener: () => {},
+    addEventListener: () => {},
+    removeEventListener: () => {},
+    dispatchEvent: () => false,
+  });
+}
 
 // Polyfill ResizeObserver for Radix UI and other libs in Vitest/JSDOM
 if (typeof window !== "undefined" && !window.ResizeObserver) {

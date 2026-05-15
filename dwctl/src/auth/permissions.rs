@@ -61,6 +61,9 @@ pub mod resource {
     #[derive(Default)]
     pub struct Webhooks;
 
+    #[derive(Default)]
+    pub struct Connections;
+
     // Convert type-level markers to enum values using Into
     impl From<Users> for Resource {
         fn from(_: Users) -> Resource {
@@ -149,6 +152,20 @@ pub mod resource {
     impl From<Organizations> for Resource {
         fn from(_: Organizations) -> Resource {
             Resource::Organizations
+        }
+    }
+
+    #[derive(Default)]
+    pub struct ToolSources;
+
+    impl From<ToolSources> for Resource {
+        fn from(_: ToolSources) -> Resource {
+            Resource::ToolSources
+        }
+    }
+    impl From<Connections> for Resource {
+        fn from(_: Connections) -> Resource {
+            Resource::Connections
         }
     }
 }
@@ -325,8 +342,9 @@ pub fn role_has_permission(role: &Role, resource: Resource, operation: Operation
                     | (Resource::Webhooks, Operation::ReadOwn)    // Can read own webhooks
                     | (Resource::Webhooks, Operation::UpdateOwn)  // Can update own webhooks
                     | (Resource::Webhooks, Operation::DeleteOwn) // Can delete own webhooks
-                    | (Resource::Organizations, Operation::ReadOwn)   // Can read own organizations
-                    | (Resource::Organizations, Operation::UpdateOwn) // Can manage orgs they belong to
+                    | (Resource::Organizations, Operation::ReadOwn)    // Can read own organizations
+                    | (Resource::Organizations, Operation::UpdateOwn)  // Can manage orgs they belong to
+                    | (Resource::Organizations, Operation::CreateOwn) // Can create own organizations
             )
         }
         Role::RequestViewer => {
@@ -362,6 +380,20 @@ pub fn role_has_permission(role: &Role, resource: Resource, operation: Operation
                     | (Resource::Batches, Operation::ReadOwn)   // Can read own batches
                     | (Resource::Batches, Operation::UpdateOwn) // Can cancel own batches
                     | (Resource::Batches, Operation::DeleteOwn) // Can delete own batches
+            )
+        }
+        Role::ConnectionsUser => {
+            // Connections User can manage their own external data source connections
+            // and trigger syncs. This role is typically given IN ADDITION to StandardUser.
+            // Synced files create batches, so this role also grants batch/file read access.
+            matches!(
+                (resource, operation),
+                (Resource::Connections, Operation::CreateOwn)  // Can create own connections
+                    | (Resource::Connections, Operation::ReadOwn)   // Can read own connections
+                    | (Resource::Connections, Operation::UpdateOwn) // Can update own connections
+                    | (Resource::Connections, Operation::DeleteOwn) // Can delete own connections
+                    | (Resource::Files, Operation::ReadOwn)         // Can read own files (created by sync)
+                    | (Resource::Batches, Operation::ReadOwn) // Can read own batches (created by sync)
             )
         }
     }
@@ -632,6 +664,52 @@ mod tests {
     }
 
     #[test]
+    fn test_connections_user_role() {
+        let conn_user = create_user_with_roles(vec![Role::ConnectionsUser], false);
+
+        // Should have connection management permissions
+        assert!(has_permission(&conn_user, Resource::Connections, Operation::CreateOwn));
+        assert!(has_permission(&conn_user, Resource::Connections, Operation::ReadOwn));
+        assert!(has_permission(&conn_user, Resource::Connections, Operation::UpdateOwn));
+        assert!(has_permission(&conn_user, Resource::Connections, Operation::DeleteOwn));
+
+        // Should have read access to files and batches (created by sync)
+        assert!(has_permission(&conn_user, Resource::Files, Operation::ReadOwn));
+        assert!(has_permission(&conn_user, Resource::Batches, Operation::ReadOwn));
+
+        // Should NOT have broad access
+        assert!(!has_permission(&conn_user, Resource::Connections, Operation::ReadAll));
+        assert!(!has_permission(&conn_user, Resource::Files, Operation::CreateOwn));
+        assert!(!has_permission(&conn_user, Resource::Batches, Operation::CreateOwn));
+        assert!(!has_permission(&conn_user, Resource::ApiKeys, Operation::CreateOwn));
+        assert!(!has_permission(&conn_user, Resource::Models, Operation::ReadOwn));
+        assert!(!has_permission(&conn_user, Resource::Requests, Operation::ReadAll));
+        assert!(!has_permission(&conn_user, Resource::Users, Operation::ReadAll));
+    }
+
+    #[test]
+    fn test_connections_user_with_standard_user() {
+        // Typical combination: StandardUser + ConnectionsUser
+        let user = create_user_with_roles(vec![Role::StandardUser, Role::ConnectionsUser], false);
+
+        // Should have StandardUser permissions
+        assert!(has_permission(&user, Resource::ApiKeys, Operation::CreateOwn));
+        assert!(has_permission(&user, Resource::Models, Operation::ReadOwn));
+        assert!(has_permission(&user, Resource::Users, Operation::ReadOwn));
+
+        // And ConnectionsUser permissions
+        assert!(has_permission(&user, Resource::Connections, Operation::CreateOwn));
+        assert!(has_permission(&user, Resource::Connections, Operation::ReadOwn));
+        assert!(has_permission(&user, Resource::Connections, Operation::DeleteOwn));
+        assert!(has_permission(&user, Resource::Files, Operation::ReadOwn));
+        assert!(has_permission(&user, Resource::Batches, Operation::ReadOwn));
+
+        // But still not admin-level permissions
+        assert!(!has_permission(&user, Resource::Connections, Operation::ReadAll));
+        assert!(!has_permission(&user, Resource::Users, Operation::CreateAll));
+    }
+
+    #[test]
     fn test_system_resource_permissions() {
         let admin = create_user_with_roles(vec![Role::StandardUser], true);
         let pm = create_user_with_roles(vec![Role::PlatformManager], false);
@@ -696,13 +774,19 @@ mod tests {
         let mut conn = pool.acquire().await.unwrap();
         let mut orgs = Organizations::new(&mut conn);
         let org = orgs
-            .create(&OrganizationCreateDBRequest {
-                name: "acme".to_string(),
-                email: "org@acme.com".to_string(),
-                display_name: None,
-                avatar_url: None,
-                created_by: alice.id,
-            })
+            .create(
+                &OrganizationCreateDBRequest {
+                    name: "acme".to_string(),
+                    email: "org@acme.com".to_string(),
+                    display_name: None,
+                    avatar_url: None,
+                    created_by: alice.id,
+                },
+                &[
+                    crate::api::models::users::Role::StandardUser,
+                    crate::api::models::users::Role::BatchAPIUser,
+                ],
+            )
             .await
             .unwrap();
 
@@ -720,13 +804,19 @@ mod tests {
         let mut conn = pool.acquire().await.unwrap();
         let mut orgs = Organizations::new(&mut conn);
         let org = orgs
-            .create(&OrganizationCreateDBRequest {
-                name: "acme".to_string(),
-                email: "org@acme.com".to_string(),
-                display_name: None,
-                avatar_url: None,
-                created_by: alice.id,
-            })
+            .create(
+                &OrganizationCreateDBRequest {
+                    name: "acme".to_string(),
+                    email: "org@acme.com".to_string(),
+                    display_name: None,
+                    avatar_url: None,
+                    created_by: alice.id,
+                },
+                &[
+                    crate::api::models::users::Role::StandardUser,
+                    crate::api::models::users::Role::BatchAPIUser,
+                ],
+            )
             .await
             .unwrap();
         orgs.add_member(org.id, bob.id, "member").await.unwrap();
@@ -745,13 +835,19 @@ mod tests {
         let mut conn = pool.acquire().await.unwrap();
         let mut orgs = Organizations::new(&mut conn);
         let org = orgs
-            .create(&OrganizationCreateDBRequest {
-                name: "acme".to_string(),
-                email: "org@acme.com".to_string(),
-                display_name: None,
-                avatar_url: None,
-                created_by: alice.id,
-            })
+            .create(
+                &OrganizationCreateDBRequest {
+                    name: "acme".to_string(),
+                    email: "org@acme.com".to_string(),
+                    display_name: None,
+                    avatar_url: None,
+                    created_by: alice.id,
+                },
+                &[
+                    crate::api::models::users::Role::StandardUser,
+                    crate::api::models::users::Role::BatchAPIUser,
+                ],
+            )
             .await
             .unwrap();
         orgs.add_member(org.id, charlie.id, "admin").await.unwrap();
@@ -770,13 +866,19 @@ mod tests {
         let mut conn = pool.acquire().await.unwrap();
         let mut orgs = Organizations::new(&mut conn);
         let org = orgs
-            .create(&OrganizationCreateDBRequest {
-                name: "acme".to_string(),
-                email: "org@acme.com".to_string(),
-                display_name: None,
-                avatar_url: None,
-                created_by: alice.id,
-            })
+            .create(
+                &OrganizationCreateDBRequest {
+                    name: "acme".to_string(),
+                    email: "org@acme.com".to_string(),
+                    display_name: None,
+                    avatar_url: None,
+                    created_by: alice.id,
+                },
+                &[
+                    crate::api::models::users::Role::StandardUser,
+                    crate::api::models::users::Role::BatchAPIUser,
+                ],
+            )
             .await
             .unwrap();
 
@@ -795,13 +897,19 @@ mod tests {
         let mut conn = pool.acquire().await.unwrap();
         let mut orgs = Organizations::new(&mut conn);
         let org = orgs
-            .create(&OrganizationCreateDBRequest {
-                name: "acme".to_string(),
-                email: "org@acme.com".to_string(),
-                display_name: None,
-                avatar_url: None,
-                created_by: alice.id, // alice = owner
-            })
+            .create(
+                &OrganizationCreateDBRequest {
+                    name: "acme".to_string(),
+                    email: "org@acme.com".to_string(),
+                    display_name: None,
+                    avatar_url: None,
+                    created_by: alice.id, // alice = owner
+                },
+                &[
+                    crate::api::models::users::Role::StandardUser,
+                    crate::api::models::users::Role::BatchAPIUser,
+                ],
+            )
             .await
             .unwrap();
         orgs.add_member(org.id, bob.id, "member").await.unwrap();

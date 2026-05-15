@@ -42,6 +42,38 @@ export function AuthProvider({ children }: AuthProviderProps) {
         user,
       );
 
+      // Redirect first-time users to onboarding if configured. The server
+      // includes onboarding_redirect_url for recently-created accounts. We
+      // persist a localStorage flag after the first redirect so users aren't
+      // sent back to onboarding on every page load. Org invite redirect
+      // params take priority.
+      if (user.onboarding_redirect_url) {
+        const urlRedirect = new URLSearchParams(window.location.search).get("redirect");
+        if (!urlRedirect) {
+          try {
+            const onboardingKey = `onboarding_completed_${user.id}`;
+            if (!localStorage.getItem(onboardingKey)) {
+              // Build the URL first so a malformed onboarding_redirect_url
+              // doesn't leave the completion flag set permanently.
+              const onboardingUrl = new URL(user.onboarding_redirect_url, window.location.origin);
+              const currentParams = new URLSearchParams(window.location.search);
+              currentParams.forEach((v, k) => {
+                if (k !== "redirect" && !onboardingUrl.searchParams.has(k)) {
+                  onboardingUrl.searchParams.set(k, v);
+                }
+              });
+              localStorage.setItem(onboardingKey, "true");
+              window.location.href = onboardingUrl.toString();
+              return;
+            }
+          } catch {
+            // localStorage unavailable (disabled, quota exceeded, etc.) —
+            // skip redirect to avoid an infinite loop since we can't
+            // persist the onboarding_completed guard.
+          }
+        }
+      }
+
       // Determine auth method based on response headers or user data
       const authMethod = user.auth_source === "native" ? "native" : "proxy";
 
@@ -73,40 +105,38 @@ export function AuthProvider({ children }: AuthProviderProps) {
   }, [isDemoMode, isMswReady, checkAuthStatus]);
 
   const login = async (credentials: LoginCredentials) => {
-    const response = await dwctlApi.auth.login(credentials);
+    await dwctlApi.auth.login(credentials);
 
-    setAuthState({
-      user: response.user,
-      isAuthenticated: true,
-      isLoading: false,
-      authMethod: "native",
-    });
+    // Re-fetch current user to pick up onboarding redirect and full user data
+    await checkAuthStatus();
 
     // Invalidate user queries to refresh data
     queryClient.invalidateQueries({ queryKey: queryKeys.users.all });
   };
 
   const register = async (credentials: RegisterCredentials) => {
-    const response = await dwctlApi.auth.register(credentials);
+    await dwctlApi.auth.register(credentials);
 
-    setAuthState({
-      user: response.user,
-      isAuthenticated: true,
-      isLoading: false,
-      authMethod: "native",
-    });
+    // Re-fetch current user to pick up onboarding redirect and full user data
+    await checkAuthStatus();
 
     // Invalidate user queries to refresh data
     queryClient.invalidateQueries({ queryKey: queryKeys.users.all });
   };
 
   const logout = async () => {
+    if (authState.authMethod === "proxy") {
+      // SSO users must go through oauth2-proxy sign_out to clear the
+      // dw_cookie. Skipping this leaves a stale SSO cookie that causes
+      // a 401 loop on next login.
+      window.location.href = "/authentication/logout";
+      return;
+    }
     try {
       await dwctlApi.auth.logout();
-      // Always redirect to root after successful logout
       window.location.href = "/";
     } catch {
-      // POST failed. Assume that its because of proxy auth and redirect to logout endpoint
+      // POST failed — fall back to proxy logout
       window.location.href = "/authentication/logout";
     }
   };

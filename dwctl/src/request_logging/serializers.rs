@@ -40,7 +40,7 @@
 //! [outlet]: https://github.com/doublewordai/outlet
 
 use crate::config::Config;
-use crate::request_logging::models::{AiRequest, AiResponse, ChatCompletionChunk, ParsedAIRequest, ResponsesRequest};
+use crate::request_logging::models::{AiRequest, AiResponse, ChatCompletionChunk, CompletionChunk, ParsedAIRequest, ResponsesRequest};
 use async_openai::types::responses::ResponseStreamEvent;
 use outlet::{RequestData, ResponseData};
 use outlet_postgres::SerializationError;
@@ -90,6 +90,7 @@ pub struct HttpAnalyticsRow {
     pub duration_to_first_byte_ms: Option<i64>,
     pub prompt_tokens: i64,
     pub completion_tokens: i64,
+    pub reasoning_tokens: i64,
     pub total_tokens: i64,
     pub response_type: String,
     pub user_id: Option<Uuid>,
@@ -131,6 +132,7 @@ pub struct UsageMetrics {
     pub duration_to_first_byte_ms: Option<i64>,
     pub prompt_tokens: i64,
     pub completion_tokens: i64,
+    pub reasoning_tokens: i64,
     pub total_tokens: i64,
     pub response_type: String,
     pub server_address: String,
@@ -152,7 +154,7 @@ pub struct UsageMetrics {
 /// - On parse failure, returns error with base64-encoded body for safe PostgreSQL storage
 /// - For `/v1/responses` paths, uses path-based detection to avoid serde disambiguation
 ///   issues with the embeddings variant (both use an `input` field).
-#[instrument(skip_all)]
+#[instrument(skip_all, name = "dwctl.parse_ai_request")]
 pub fn parse_ai_request(request_data: &RequestData) -> Result<ParsedAIRequest, SerializationError> {
     let headers = request_data
         .headers
@@ -237,7 +239,7 @@ pub fn parse_ai_request(request_data: &RequestData) -> Result<ParsedAIRequest, S
 /// - Handles gzip/brotli decompression based on Content-Encoding headers
 /// - Parses streaming responses (SSE format) vs non-streaming based on request stream parameter
 /// - On parse failure, returns error with base64-encoded decompressed body
-#[instrument(skip_all)]
+#[instrument(skip_all, name = "dwctl.parse_ai_response")]
 pub fn parse_ai_response(request_data: &RequestData, response_data: &ResponseData) -> Result<AiResponse, SerializationError> {
     let bytes = match &response_data.body {
         Some(body) => body.as_ref(),
@@ -255,12 +257,22 @@ pub fn parse_ai_response(request_data: &RequestData, response_data: &ResponseDat
         return Ok(AiResponse::Other(Value::Null));
     }
 
+    // Onwards injects stream:true into the forwarded body when it sees this header,
+    // but outlet captures the original request body (without stream:true). Check the
+    // header so we know to use the streaming parser for the response.
+    let fusillade_stream = request_data
+        .headers
+        .get("x-fusillade-stream")
+        .and_then(|values| values.first())
+        .and_then(|bytes| std::str::from_utf8(bytes).ok())
+        == Some("true");
+
     // Parse response based on request type
     let result = match parse_ai_request(request_data) {
         Ok(parsed_request) => {
             // /v1/responses has its own SSE event format distinct from chat completions.
             if let Some(responses_req) = &parsed_request.responses_request {
-                if responses_req.stream.unwrap_or(false) {
+                if responses_req.stream.unwrap_or(false) || fusillade_stream {
                     utils::parse_responses_streaming_response(&body_str)
                 } else {
                     // Try the typed Response parser first. Fall back to the generic untagged
@@ -270,9 +282,11 @@ pub fn parse_ai_response(request_data: &RequestData, response_data: &ResponseDat
                 }
             } else {
                 match parsed_request.request {
-                    AiRequest::ChatCompletions(chat_req) if chat_req.stream.unwrap_or(false) => utils::parse_streaming_response(&body_str),
-                    AiRequest::Completions(completion_req) if completion_req.stream.unwrap_or(false) => {
+                    AiRequest::ChatCompletions(chat_req) if chat_req.stream.unwrap_or(false) || fusillade_stream => {
                         utils::parse_streaming_response(&body_str)
+                    }
+                    AiRequest::Completions(completion_req) if completion_req.stream.unwrap_or(false) || fusillade_stream => {
+                        utils::parse_completions_streaming_response(&body_str)
                     }
                     _ => utils::parse_non_streaming_response(&body_str),
                 }
@@ -302,7 +316,7 @@ impl UsageMetrics {
     ///
     /// # Returns
     /// A `UsageMetrics` struct with extracted model, tokens, and timing data
-    #[instrument(skip_all, name = "extract_usage_metrics")]
+    #[instrument(skip_all, name = "dwctl.extract_usage_metrics")]
     pub fn extract(
         instance_id: Uuid,
         request_data: &RequestData,
@@ -344,6 +358,23 @@ impl UsageMetrics {
         // Extract token metrics and response model from response
         let response_metrics = TokenMetrics::from(parsed_response);
 
+        // Streams that started with HTTP 200 but ended with an embedded provider error frame
+        // get reclassified to 500 so success-rate / availability metrics, the credits-eligibility
+        // check, and dashboards keyed on `status_code BETWEEN 200 AND 299` exclude them.
+        // 500 matches what fusillade reclassifies these to in its HTTP layer, so the two views
+        // (analytics row, fusillade request state) agree on a number for the same logical event.
+        let upstream_status = response_data.status.as_u16() as i32;
+        let stream_errored = match parsed_response {
+            AiResponse::ChatCompletionsStream(chunks) => chunks.iter().any(|c| matches!(c, ChatCompletionChunk::Error(_))),
+            AiResponse::CompletionsStream(chunks) => chunks.iter().any(|c| matches!(c, CompletionChunk::Error(_))),
+            _ => false,
+        };
+        let status_code = if upstream_status < 400 && stream_errored {
+            500
+        } else {
+            upstream_status
+        };
+
         Self {
             instance_id,
             correlation_id: request_data.correlation_id as i64,
@@ -352,11 +383,12 @@ impl UsageMetrics {
             uri: request_data.uri.to_string(),
             request_model,
             response_model: response_metrics.response_model,
-            status_code: response_data.status.as_u16() as i32,
+            status_code,
             duration_ms: response_data.duration.as_millis() as i64,
             duration_to_first_byte_ms: Some(response_data.duration_to_first_byte.as_millis() as i64),
             prompt_tokens: response_metrics.prompt_tokens,
             completion_tokens: response_metrics.completion_tokens,
+            reasoning_tokens: response_metrics.reasoning_tokens,
             total_tokens: response_metrics.total_tokens,
             response_type: response_metrics.response_type,
             server_address: config.host.clone(),
@@ -367,7 +399,7 @@ impl UsageMetrics {
 
 impl Auth {
     /// Extract authentication from request headers
-    #[instrument(skip_all, name = "extract_auth")]
+    #[instrument(skip_all, name = "dwctl.extract_auth")]
     pub fn from_request(request_data: &RequestData, _config: &Config) -> Self {
         // Check for API key in Authorization header
         if let Some(auth_header) = Self::get_header_value(request_data, "authorization")
@@ -397,9 +429,23 @@ impl Auth {
 struct TokenMetrics {
     prompt_tokens: i64,
     completion_tokens: i64,
+    reasoning_tokens: i64,
     total_tokens: i64,
     response_type: String,
     response_model: Option<String>,
+}
+
+fn extract_completion_reasoning_tokens(usage: &async_openai::types::chat::CompletionUsage) -> i64 {
+    usage
+        .completion_tokens_details
+        .as_ref()
+        .and_then(|d| d.reasoning_tokens)
+        .map(|t| t as i64)
+        .unwrap_or(0)
+}
+
+fn extract_response_reasoning_tokens(usage: &async_openai::types::responses::ResponseUsage) -> i64 {
+    usage.output_tokens_details.reasoning_tokens as i64
 }
 
 impl From<&AiResponse> for TokenMetrics {
@@ -410,6 +456,7 @@ impl From<&AiResponse> for TokenMetrics {
                     Self {
                         prompt_tokens: usage.prompt_tokens as i64,
                         completion_tokens: usage.completion_tokens as i64,
+                        reasoning_tokens: extract_completion_reasoning_tokens(usage),
                         total_tokens: usage.total_tokens as i64,
                         response_type: "chat_completion".to_string(),
                         response_model: Some(response.model.clone()),
@@ -418,6 +465,7 @@ impl From<&AiResponse> for TokenMetrics {
                     Self {
                         prompt_tokens: 0,
                         completion_tokens: 0,
+                        reasoning_tokens: 0,
                         total_tokens: 0,
                         response_type: "chat_completion".to_string(),
                         response_model: Some(response.model.clone()),
@@ -442,6 +490,7 @@ impl From<&AiResponse> for TokenMetrics {
                         Self {
                             prompt_tokens: usage.prompt_tokens as i64,
                             completion_tokens: usage.completion_tokens as i64,
+                            reasoning_tokens: extract_completion_reasoning_tokens(usage),
                             total_tokens: usage.total_tokens as i64,
                             response_type: "chat_completion_stream".to_string(),
                             response_model: model,
@@ -451,6 +500,7 @@ impl From<&AiResponse> for TokenMetrics {
                         Self {
                             prompt_tokens: 0,
                             completion_tokens: 0,
+                            reasoning_tokens: 0,
                             total_tokens: 0,
                             response_type: "chat_completion_stream".to_string(),
                             response_model: model,
@@ -460,8 +510,51 @@ impl From<&AiResponse> for TokenMetrics {
                     Self {
                         prompt_tokens: 0,
                         completion_tokens: 0,
+                        reasoning_tokens: 0,
                         total_tokens: 0,
                         response_type: "chat_completion_stream".to_string(),
+                        response_model: model,
+                    }
+                }
+            }
+            AiResponse::CompletionsStream(chunks) => {
+                let last_normal_with_usage = chunks.iter().rev().find_map(|chunk| match chunk {
+                    CompletionChunk::Normal(normal_chunk) if normal_chunk.usage.is_some() => Some(normal_chunk),
+                    _ => None,
+                });
+
+                let model = chunks.iter().find_map(|chunk| match chunk {
+                    CompletionChunk::Normal(c) => Some(c.model.clone()),
+                    _ => None,
+                });
+
+                if let Some(chunk) = last_normal_with_usage {
+                    if let Some(usage) = &chunk.usage {
+                        Self {
+                            prompt_tokens: usage.prompt_tokens as i64,
+                            completion_tokens: usage.completion_tokens as i64,
+                            reasoning_tokens: extract_completion_reasoning_tokens(usage),
+                            total_tokens: usage.total_tokens as i64,
+                            response_type: "completion_stream".to_string(),
+                            response_model: model,
+                        }
+                    } else {
+                        Self {
+                            prompt_tokens: 0,
+                            completion_tokens: 0,
+                            reasoning_tokens: 0,
+                            total_tokens: 0,
+                            response_type: "completion_stream".to_string(),
+                            response_model: model,
+                        }
+                    }
+                } else {
+                    Self {
+                        prompt_tokens: 0,
+                        completion_tokens: 0,
+                        reasoning_tokens: 0,
+                        total_tokens: 0,
+                        response_type: "completion_stream".to_string(),
                         response_model: model,
                     }
                 }
@@ -471,6 +564,7 @@ impl From<&AiResponse> for TokenMetrics {
                     Self {
                         prompt_tokens: usage.prompt_tokens as i64,
                         completion_tokens: usage.completion_tokens as i64,
+                        reasoning_tokens: extract_completion_reasoning_tokens(usage),
                         total_tokens: usage.total_tokens as i64,
                         response_type: "completion".to_string(),
                         response_model: Some(response.model.clone()),
@@ -479,6 +573,7 @@ impl From<&AiResponse> for TokenMetrics {
                     Self {
                         prompt_tokens: 0,
                         completion_tokens: 0,
+                        reasoning_tokens: 0,
                         total_tokens: 0,
                         response_type: "completion".to_string(),
                         response_model: Some(response.model.clone()),
@@ -490,6 +585,7 @@ impl From<&AiResponse> for TokenMetrics {
                 Self {
                     prompt_tokens: usage.prompt_tokens as i64,
                     completion_tokens: 0, // Embeddings don't have completion tokens
+                    reasoning_tokens: 0,
                     total_tokens: usage.total_tokens as i64,
                     response_type: "embeddings".to_string(),
                     response_model: Some(response.model.clone()),
@@ -500,6 +596,7 @@ impl From<&AiResponse> for TokenMetrics {
                 Self {
                     prompt_tokens: usage.prompt_tokens as i64,
                     completion_tokens: 0, // Embeddings don't have completion tokens
+                    reasoning_tokens: 0,
                     total_tokens: usage.total_tokens as i64,
                     response_type: "base64_embeddings".to_string(),
                     response_model: Some(response.model.clone()),
@@ -510,6 +607,7 @@ impl From<&AiResponse> for TokenMetrics {
                     Self {
                         prompt_tokens: usage.input_tokens as i64,
                         completion_tokens: usage.output_tokens as i64,
+                        reasoning_tokens: extract_response_reasoning_tokens(usage),
                         total_tokens: usage.total_tokens as i64,
                         response_type: "response".to_string(),
                         response_model: Some(response.model.clone()),
@@ -518,6 +616,7 @@ impl From<&AiResponse> for TokenMetrics {
                     Self {
                         prompt_tokens: 0,
                         completion_tokens: 0,
+                        reasoning_tokens: 0,
                         total_tokens: 0,
                         response_type: "response".to_string(),
                         response_model: Some(response.model.clone()),
@@ -540,6 +639,7 @@ impl From<&AiResponse> for TokenMetrics {
                     Self {
                         prompt_tokens: usage.input_tokens as i64,
                         completion_tokens: usage.output_tokens as i64,
+                        reasoning_tokens: extract_response_reasoning_tokens(usage),
                         total_tokens: usage.total_tokens as i64,
                         response_type: "response_stream".to_string(),
                         response_model: model,
@@ -548,6 +648,7 @@ impl From<&AiResponse> for TokenMetrics {
                     Self {
                         prompt_tokens: 0,
                         completion_tokens: 0,
+                        reasoning_tokens: 0,
                         total_tokens: 0,
                         response_type: "response_stream".to_string(),
                         response_model: model,
@@ -557,6 +658,7 @@ impl From<&AiResponse> for TokenMetrics {
             AiResponse::Other(_) => Self {
                 prompt_tokens: 0,
                 completion_tokens: 0,
+                reasoning_tokens: 0,
                 total_tokens: 0,
                 response_type: "other".to_string(),
                 response_model: None,
@@ -590,6 +692,8 @@ mod tests {
             uri: "/test".parse::<Uri>().unwrap(),
             headers: HashMap::new(),
             body: None,
+            trace_id: None,
+            span_id: None,
         };
 
         let result = parse_ai_request(&request_data).unwrap();
@@ -609,6 +713,8 @@ mod tests {
             uri: "/test".parse::<Uri>().unwrap(),
             headers: HashMap::new(),
             body: Some(Bytes::new()), // Empty bytes
+            trace_id: None,
+            span_id: None,
         };
 
         let result = parse_ai_request(&request_data).unwrap();
@@ -628,6 +734,8 @@ mod tests {
             uri: "/test".parse::<Uri>().unwrap(),
             headers: HashMap::new(),
             body: Some(Bytes::from("invalid json")),
+            trace_id: None,
+            span_id: None,
         };
 
         let result = parse_ai_request(&request_data);
@@ -647,6 +755,8 @@ mod tests {
             uri: "/test".parse::<Uri>().unwrap(),
             headers: HashMap::new(),
             body: Some(Bytes::from(json_body)),
+            trace_id: None,
+            span_id: None,
         };
 
         let result = parse_ai_request(&request_data).unwrap();
@@ -670,6 +780,8 @@ mod tests {
             uri: "/test".parse::<Uri>().unwrap(),
             headers: HashMap::new(),
             body: Some(Bytes::from(json_body)),
+            trace_id: None,
+            span_id: None,
         };
 
         let result = parse_ai_request(&request_data).unwrap();
@@ -692,6 +804,8 @@ mod tests {
             uri: "/test".parse::<Uri>().unwrap(),
             headers: HashMap::new(),
             body: Some(Bytes::from(json_body)),
+            trace_id: None,
+            span_id: None,
         };
 
         let result = parse_ai_request(&request_data).unwrap();
@@ -713,6 +827,8 @@ mod tests {
             uri: "/test".parse::<Uri>().unwrap(),
             headers: HashMap::new(),
             body: None,
+            trace_id: None,
+            span_id: None,
         };
 
         let response_data = ResponseData {
@@ -742,6 +858,8 @@ mod tests {
             uri: "/test".parse::<Uri>().unwrap(),
             headers: HashMap::new(),
             body: None,
+            trace_id: None,
+            span_id: None,
         };
 
         let response_data = ResponseData {
@@ -771,6 +889,8 @@ mod tests {
             uri: "/test".parse::<Uri>().unwrap(),
             headers: HashMap::new(),
             body: None,
+            trace_id: None,
+            span_id: None,
         };
 
         let json_response = r#"{
@@ -814,6 +934,8 @@ mod tests {
             uri: "/test".parse::<Uri>().unwrap(),
             headers: HashMap::new(),
             body: Some(Bytes::from(request_json)),
+            trace_id: None,
+            span_id: None,
         };
 
         // SSE streaming response
@@ -840,6 +962,198 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_ai_response_fusillade_stream_header() {
+        // Request body has stream: false, but x-fusillade-stream header is set.
+        // Outlet captures the original body before onwards injects stream:true,
+        // so the header is the only signal that the response is SSE.
+        let request_json = r#"{"model": "gpt-4", "messages": [{"role": "user", "content": "hello"}], "stream": false}"#;
+        let mut headers = HashMap::new();
+        headers.insert("x-fusillade-stream".to_string(), vec![Bytes::from("true")]);
+        let request_data = RequestData {
+            correlation_id: 123,
+            timestamp: SystemTime::now(),
+            method: Method::POST,
+            uri: "/test".parse::<Uri>().unwrap(),
+            headers,
+            body: Some(Bytes::from(request_json)),
+            trace_id: None,
+            span_id: None,
+        };
+
+        let sse_response = "data: {\"id\":\"chatcmpl-123\",\"object\":\"chat.completion.chunk\",\"created\":1677652288,\"model\":\"gpt-4\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"}}],\"usage\":null}\n\ndata: {\"id\":\"chatcmpl-123\",\"object\":\"chat.completion.chunk\",\"created\":1677652288,\"model\":\"gpt-4\",\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}\n\ndata: [DONE]\n\n";
+
+        let response_data = ResponseData {
+            correlation_id: 123,
+            timestamp: SystemTime::now(),
+            status: StatusCode::OK,
+            headers: HashMap::new(),
+            body: Some(Bytes::from(sse_response)),
+            duration: Duration::from_millis(100),
+            duration_to_first_byte: Duration::from_millis(50),
+        };
+
+        let result = parse_ai_response(&request_data, &response_data).unwrap();
+
+        match &result {
+            AiResponse::ChatCompletionsStream(chunks) => {
+                assert!(!chunks.is_empty(), "Expected parsed SSE chunks");
+                // Verify usage is extractable (this is what billing uses)
+                let metrics = UsageMetrics::extract(
+                    uuid::Uuid::nil(),
+                    &request_data,
+                    &response_data,
+                    &result,
+                    &crate::config::Config::default(),
+                );
+                assert_eq!(metrics.prompt_tokens, 10);
+                assert_eq!(metrics.completion_tokens, 5);
+                assert_eq!(metrics.total_tokens, 15);
+            }
+            other => panic!("Expected ChatCompletionsStream, got {:?}", std::mem::discriminant(other)),
+        }
+    }
+
+    #[test]
+    fn test_fusillade_stream_with_embedded_error_frame_reclassifies_to_500() {
+        // Reproduces trace 91ea8848dc08735f183449277b8b8846: Dynamo started a 200 OK
+        // SSE stream, generated some delta chunks, then crashed mid-generation and
+        // emitted an error frame in place of the terminal usage chunk + [DONE].
+        let request_json = r#"{"model": "moonshotai/Kimi-K2.6", "messages": [{"role": "user", "content": "hi"}], "stream": false}"#;
+        let mut headers = HashMap::new();
+        headers.insert("x-fusillade-stream".to_string(), vec![Bytes::from("true")]);
+        let request_data = RequestData {
+            correlation_id: 999,
+            timestamp: SystemTime::now(),
+            method: Method::POST,
+            uri: "/v1/chat/completions".parse::<Uri>().unwrap(),
+            headers,
+            body: Some(Bytes::from(request_json)),
+            trace_id: None,
+            span_id: None,
+        };
+
+        let sse_response = concat!(
+            "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"moonshotai/Kimi-K2.6\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"}}]}\n\n",
+            "data: {\"error\":{\"message\":\"Engine was shut down during token generation\",\"type\":\"internal_server_error\",\"code\":500}}\n\n",
+        );
+
+        let response_data = ResponseData {
+            correlation_id: 999,
+            timestamp: SystemTime::now(),
+            status: StatusCode::OK,
+            headers: HashMap::new(),
+            body: Some(Bytes::from(sse_response)),
+            duration: Duration::from_millis(335_000),
+            duration_to_first_byte: Duration::from_millis(2_300),
+        };
+
+        let parsed = parse_ai_response(&request_data, &response_data).unwrap();
+        let metrics = UsageMetrics::extract(
+            uuid::Uuid::nil(),
+            &request_data,
+            &response_data,
+            &parsed,
+            &crate::config::Config::default(),
+        );
+
+        assert_eq!(
+            metrics.status_code, 500,
+            "200 OK with embedded SSE error frame must be reclassified to 500 so success-rate \
+             metrics and credit-eligibility checks exclude this row, and so the analytics row \
+             agrees with fusillade's HTTP-layer reclassification"
+        );
+        assert_eq!(metrics.total_tokens, 0);
+        assert_eq!(metrics.response_type, "chat_completion_stream");
+    }
+
+    #[test]
+    fn test_fusillade_stream_with_real_error_status_is_preserved() {
+        // If upstream returns a real non-2xx status (no SSE body to scan), we must NOT
+        // override it to 500. The real status code is more informative.
+        let request_json = r#"{"model": "gpt-4", "messages": [{"role": "user", "content": "hi"}], "stream": false}"#;
+        let mut headers = HashMap::new();
+        headers.insert("x-fusillade-stream".to_string(), vec![Bytes::from("true")]);
+        let request_data = RequestData {
+            correlation_id: 7,
+            timestamp: SystemTime::now(),
+            method: Method::POST,
+            uri: "/v1/chat/completions".parse::<Uri>().unwrap(),
+            headers,
+            body: Some(Bytes::from(request_json)),
+            trace_id: None,
+            span_id: None,
+        };
+        let response_data = ResponseData {
+            correlation_id: 7,
+            timestamp: SystemTime::now(),
+            status: StatusCode::TOO_MANY_REQUESTS,
+            headers: HashMap::new(),
+            body: Some(Bytes::from(r#"{"error":{"message":"rate limit","type":"rate_limit"}}"#)),
+            duration: Duration::from_millis(50),
+            duration_to_first_byte: Duration::from_millis(50),
+        };
+
+        let parsed = parse_ai_response(&request_data, &response_data).unwrap();
+        let metrics = UsageMetrics::extract(
+            uuid::Uuid::nil(),
+            &request_data,
+            &response_data,
+            &parsed,
+            &crate::config::Config::default(),
+        );
+
+        assert_eq!(metrics.status_code, 429);
+    }
+
+    #[test]
+    fn test_parse_ai_response_fusillade_completions_stream() {
+        let request_json = r#"{"model": "gpt-3.5-turbo-instruct", "prompt": "Hello", "stream": false}"#;
+        let mut headers = HashMap::new();
+        headers.insert("x-fusillade-stream".to_string(), vec![Bytes::from("true")]);
+        let request_data = RequestData {
+            correlation_id: 123,
+            timestamp: SystemTime::now(),
+            method: Method::POST,
+            uri: "/test".parse::<Uri>().unwrap(),
+            headers,
+            body: Some(Bytes::from(request_json)),
+            trace_id: None,
+            span_id: None,
+        };
+
+        let sse_response = "data: {\"id\":\"cmpl-123\",\"object\":\"text_completion\",\"created\":1677652288,\"model\":\"gpt-3.5-turbo-instruct\",\"choices\":[{\"text\":\" world\",\"index\":0}]}\n\ndata: {\"id\":\"cmpl-123\",\"object\":\"text_completion\",\"created\":1677652288,\"model\":\"gpt-3.5-turbo-instruct\",\"choices\":[],\"usage\":{\"prompt_tokens\":8,\"completion_tokens\":12,\"total_tokens\":20}}\n\ndata: [DONE]\n\n";
+
+        let response_data = ResponseData {
+            correlation_id: 123,
+            timestamp: SystemTime::now(),
+            status: StatusCode::OK,
+            headers: HashMap::new(),
+            body: Some(Bytes::from(sse_response)),
+            duration: Duration::from_millis(100),
+            duration_to_first_byte: Duration::from_millis(50),
+        };
+
+        let result = parse_ai_response(&request_data, &response_data).unwrap();
+
+        match &result {
+            AiResponse::CompletionsStream(chunks) => {
+                assert!(!chunks.is_empty(), "Expected parsed SSE chunks");
+                let metrics = UsageMetrics::extract(
+                    uuid::Uuid::nil(),
+                    &request_data,
+                    &response_data,
+                    &result,
+                    &crate::config::Config::default(),
+                );
+                assert_eq!(metrics.prompt_tokens, 8);
+                assert_eq!(metrics.completion_tokens, 12);
+                assert_eq!(metrics.total_tokens, 20);
+            }
+            other => panic!("Expected CompletionsStream, got {:?}", std::mem::discriminant(other)),
+        }
+    }
+
+    #[test]
     fn test_parse_ai_response_embeddings() {
         let request_data = RequestData {
             correlation_id: 123,
@@ -848,6 +1162,8 @@ mod tests {
             uri: "/test".parse::<Uri>().unwrap(),
             headers: HashMap::new(),
             body: None,
+            trace_id: None,
+            span_id: None,
         };
 
         let embeddings_response = r#"{
@@ -887,6 +1203,8 @@ mod tests {
             uri: "/test".parse::<Uri>().unwrap(),
             headers: HashMap::new(),
             body: None,
+            trace_id: None,
+            span_id: None,
         };
 
         let response_data = ResponseData {
@@ -917,6 +1235,8 @@ mod tests {
             uri: "/v1/chat/completions".parse::<Uri>().unwrap(),
             headers: HashMap::new(),
             body: None,
+            trace_id: None,
+            span_id: None,
         };
 
         let response_data = ResponseData {
@@ -967,6 +1287,8 @@ mod tests {
             uri: "/v1/chat/completions".parse::<Uri>().unwrap(),
             headers: HashMap::new(),
             body: Some(Bytes::from(request_json)),
+            trace_id: None,
+            span_id: None,
         };
 
         let response_data = ResponseData {
@@ -1018,6 +1340,7 @@ mod tests {
         assert_eq!(metrics.duration_ms, 500);
         assert_eq!(metrics.prompt_tokens, 15);
         assert_eq!(metrics.completion_tokens, 25);
+        assert_eq!(metrics.reasoning_tokens, 0);
         assert_eq!(metrics.total_tokens, 40);
         assert_eq!(metrics.response_type, "chat_completion");
     }
@@ -1033,6 +1356,8 @@ mod tests {
             uri: "/v1/chat/completions".parse::<Uri>().unwrap(),
             headers: HashMap::new(),
             body: None,
+            trace_id: None,
+            span_id: None,
         };
 
         let response_data = ResponseData {
@@ -1077,8 +1402,65 @@ mod tests {
 
         assert_eq!(metrics.prompt_tokens, 8);
         assert_eq!(metrics.completion_tokens, 12);
+        assert_eq!(metrics.reasoning_tokens, 0);
         assert_eq!(metrics.total_tokens, 20);
         assert_eq!(metrics.response_type, "chat_completion_stream");
+    }
+
+    #[test]
+    fn test_analytics_metrics_extract_chat_reasoning_tokens() {
+        let instance_id = Uuid::new_v4();
+        let request_json = r#"{"model": "gpt-5", "messages": [{"role": "user", "content": "hello"}]}"#;
+        let request_data = RequestData {
+            correlation_id: 12345,
+            timestamp: SystemTime::now(),
+            method: Method::POST,
+            uri: "/v1/chat/completions".parse::<Uri>().unwrap(),
+            headers: HashMap::new(),
+            body: Some(Bytes::from(request_json)),
+            trace_id: None,
+            span_id: None,
+        };
+
+        let response_data = ResponseData {
+            correlation_id: 12345,
+            timestamp: SystemTime::now(),
+            status: StatusCode::OK,
+            headers: HashMap::new(),
+            body: None,
+            duration: Duration::from_millis(500),
+            duration_to_first_byte: Duration::from_millis(50),
+        };
+
+        let chat_response: CreateChatCompletionResponse = serde_json::from_value(serde_json::json!({
+            "id": "chatcmpl-123",
+            "object": "chat.completion",
+            "created": 1677652288,
+            "model": "gpt-5",
+            "choices": [],
+            "usage": {
+                "prompt_tokens": 15,
+                "completion_tokens": 25,
+                "total_tokens": 40,
+                "completion_tokens_details": {
+                    "reasoning_tokens": 11
+                }
+            }
+        }))
+        .unwrap();
+
+        let parsed_response = AiResponse::ChatCompletions(chat_response);
+        let metrics = UsageMetrics::extract(
+            instance_id,
+            &request_data,
+            &response_data,
+            &parsed_response,
+            &crate::test::utils::create_test_config(),
+        );
+
+        assert_eq!(metrics.reasoning_tokens, 11);
+        assert_eq!(metrics.completion_tokens, 25);
+        assert_eq!(metrics.total_tokens, 40);
     }
 
     #[test]
@@ -1092,6 +1474,8 @@ mod tests {
             uri: "/v1/embeddings".parse::<Uri>().unwrap(),
             headers: HashMap::new(),
             body: None,
+            trace_id: None,
+            span_id: None,
         };
 
         let response_data = ResponseData {
@@ -1141,6 +1525,8 @@ mod tests {
             uri: "/v1/completions".parse::<Uri>().unwrap(),
             headers: HashMap::new(),
             body: None,
+            trace_id: None,
+            span_id: None,
         };
 
         let response_data = ResponseData {
@@ -1197,6 +1583,8 @@ mod tests {
             uri: "/v1/embeddings".parse::<Uri>().unwrap(),
             headers: HashMap::new(),
             body: None,
+            trace_id: None,
+            span_id: None,
         };
 
         let response_data = ResponseData {
@@ -1261,6 +1649,8 @@ mod tests {
             uri: "/v1/responses".parse::<Uri>().unwrap(),
             headers: HashMap::new(),
             body: Some(Bytes::from(body)),
+            trace_id: None,
+            span_id: None,
         }
     }
 
@@ -1312,10 +1702,35 @@ mod tests {
                 let usage = resp.usage.expect("usage should be present");
                 assert_eq!(usage.input_tokens, 15);
                 assert_eq!(usage.output_tokens, 25);
+                assert_eq!(usage.output_tokens_details.reasoning_tokens, 0);
                 assert_eq!(usage.total_tokens, 40);
             }
             _ => panic!("expected AiResponse::Responses"),
         }
+    }
+
+    #[test]
+    fn test_analytics_metrics_extract_responses_reasoning_tokens() {
+        let instance_id = Uuid::new_v4();
+        let request_data = responses_request_data(None);
+        let response_data = responses_response_data(
+            r#"{"id":"resp_123","object":"response","created_at":1234567890,"model":"gpt-4o","status":"completed","output":[],"usage":{"input_tokens":15,"input_tokens_details":{"cached_tokens":0},"output_tokens":25,"output_tokens_details":{"reasoning_tokens":9},"total_tokens":40}}"#
+                .to_string(),
+        );
+
+        let parsed_response = parse_ai_response(&request_data, &response_data).unwrap();
+        let metrics = UsageMetrics::extract(
+            instance_id,
+            &request_data,
+            &response_data,
+            &parsed_response,
+            &crate::test::utils::create_test_config(),
+        );
+
+        assert_eq!(metrics.reasoning_tokens, 9);
+        assert_eq!(metrics.completion_tokens, 25);
+        assert_eq!(metrics.total_tokens, 40);
+        assert_eq!(metrics.response_type, "response");
     }
 
     #[test]

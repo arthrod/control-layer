@@ -13,6 +13,7 @@ import {
   Check,
   Copy,
   GitMerge,
+  Trash2,
 } from "lucide-react";
 import {
   useModel,
@@ -26,13 +27,20 @@ import {
 import type {
   ApiKeyPurpose,
   ModelMetadata,
+  ModelDisplayCategory,
   TrafficRoutingRule,
 } from "../../../../api/control-layer";
-import { useAuthorization, isPlaygroundDenied } from "../../../../utils";
+import {
+  useAuthorization,
+  isPlaygroundDenied,
+  getTariffDisplayName,
+  copyToClipboard,
+} from "../../../../utils";
 import {
   ApiExamples,
   AccessManagementModal,
   UpdateModelPricingModal,
+  DeleteVirtualModelModal,
 } from "../../../modals";
 import UserUsageTable from "./UserUsageTable";
 import ModelProbes from "./ModelProbes";
@@ -85,12 +93,26 @@ const TRAFFIC_PURPOSE_OPTIONS: ApiKeyPurpose[] = [
   "playground",
 ];
 
+const DISPLAY_CATEGORY_OPTIONS: {
+  value: ModelDisplayCategory;
+  label: string;
+}[] = [
+  { value: "generation", label: "Generation" },
+  { value: "embedding", label: "Embedding" },
+  { value: "ocr", label: "OCR" },
+];
+
 const ModelInfo: React.FC = () => {
   const { modelId } = useParams<{ modelId: string }>();
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
   const { hasPermission } = useAuthorization();
   const canManageGroups = hasPermission("manage-groups");
+  // Both `manage-groups` and `manage-models` are granted exclusively to
+  // PlatformManager (see ROLE_PERMISSIONS in utils/authorization.ts), so
+  // either permission is a PM-only gate. We keep them named explicitly so
+  // the intent is clear at the call site.
+  const canManageModels = hasPermission("manage-models");
   const canViewAnalytics = hasPermission("analytics");
   const canViewEndpoints = hasPermission("endpoints");
 
@@ -130,6 +152,7 @@ const ModelInfo: React.FC = () => {
   // Settings form state
   const [updateData, setUpdateData] = useState({
     alias: "",
+    display_name: "",
     description: "",
     model_type: "" as "CHAT" | "EMBEDDINGS" | "",
     capabilities: [] as string[],
@@ -156,6 +179,7 @@ const ModelInfo: React.FC = () => {
   const [showAccessModal, setShowAccessModal] = useState(false);
   const [isEditingModelDetails, setIsEditingModelDetails] = useState(false);
   const [showPricingModal, setShowPricingModal] = useState(false);
+  const [showDeleteVirtualModal, setShowDeleteVirtualModal] = useState(false);
   const [aliasCopied, setAliasCopied] = useState(false);
 
   // Alias form
@@ -233,6 +257,7 @@ const ModelInfo: React.FC = () => {
 
       setUpdateData({
         alias: model.alias,
+        display_name: model.display_name || "",
         description: model.description || "",
         model_type: effectiveType as "CHAT" | "EMBEDDINGS",
         capabilities: model.capabilities || [],
@@ -291,6 +316,7 @@ const ModelInfo: React.FC = () => {
         id: model.id,
         data: {
           alias: updateData.alias,
+          display_name: updateData.display_name || null,
           description: updateData.description,
           model_type:
             updateData.model_type === ""
@@ -329,6 +355,7 @@ const ModelInfo: React.FC = () => {
       const effectiveType = model.model_type || "CHAT";
       setUpdateData({
         alias: model.alias,
+        display_name: model.display_name || "",
         description: model.description || "",
         model_type: effectiveType as "CHAT" | "EMBEDDINGS",
         capabilities: model.capabilities || [],
@@ -540,11 +567,11 @@ const ModelInfo: React.FC = () => {
                         type="button"
                         className="shrink-0 p-1 text-gray-400 hover:text-gray-600 transition-colors"
                         aria-label="Copy model alias"
-                        onClick={() => {
-                          navigator.clipboard.writeText(model.alias).then(() => {
+                        onClick={async () => {
+                          if (await copyToClipboard(model.alias)) {
                             setAliasCopied(true);
                             setTimeout(() => setAliasCopied(false), 1500);
-                          });
+                          }
                         }}
                       >
                         {aliasCopied ? (
@@ -637,6 +664,19 @@ const ModelInfo: React.FC = () => {
                         </TabsTrigger>
                       )}
                     </TabsList>
+                    {model.is_composite && canManageModels && (
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        onClick={() => setShowDeleteVirtualModal(true)}
+                        className="h-8 w-8 p-0"
+                        aria-label="Delete virtual model"
+                        title="Delete virtual model"
+                      >
+                        <Trash2 className="h-4 w-4" />
+                      </Button>
+                    )}
                   </div>
                 )}
               </div>
@@ -694,6 +734,24 @@ const ModelInfo: React.FC = () => {
                             className="font-medium"
                             placeholder="Model alias"
                           />
+                        </div>
+                        <div>
+                          <label className="text-sm text-gray-600 mb-2 block">
+                            Display Name
+                          </label>
+                          <Input
+                            value={updateData.display_name}
+                            onChange={(e) =>
+                              setUpdateData((prev) => ({
+                                ...prev,
+                                display_name: e.target.value,
+                              }))
+                            }
+                            placeholder="Human-readable name for catalog"
+                          />
+                          <p className="text-xs text-gray-400 mt-1">
+                            Shown in the model catalog instead of alias
+                          </p>
                         </div>
                         <div>
                           <label className="text-sm text-gray-600 mb-2 block">
@@ -759,17 +817,17 @@ const ModelInfo: React.FC = () => {
                             {[
                               { id: "vision", label: "Vision", tip: "Enables image upload in the playground." },
                               { id: "reasoning", label: "Reasoning", tip: "Model supports extended reasoning / chain-of-thought." },
+                              { id: "enhanced_structured_generation", label: "Enhanced Structured Generation", tip: "Model supports enhanced generation for complex schema generation." },
                             ].map((cap) => (
-                              <div key={cap.id} className="flex items-center space-x-2">
-                                <input
-                                  type="checkbox"
+                              <label key={cap.id} className="flex items-center gap-2 text-sm">
+                                <Checkbox
                                   id={`${cap.id}-capability`}
                                   checked={
                                     updateData.capabilities?.includes(cap.id) ??
                                     false
                                   }
-                                  onChange={(e) => {
-                                    const newCapabilities = e.target.checked
+                                  onCheckedChange={(checked) => {
+                                    const newCapabilities = checked
                                       ? [
                                           ...(updateData.capabilities || []),
                                           cap.id,
@@ -782,34 +840,30 @@ const ModelInfo: React.FC = () => {
                                       capabilities: newCapabilities,
                                     }));
                                   }}
-                                  className="h-4 w-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
                                 />
-                                <label
-                                  htmlFor={`${cap.id}-capability`}
-                                  className="text-sm font-medium leading-none peer-disabled:cursor-not-allowed peer-disabled:opacity-70 flex items-center gap-1"
-                                >
+                                <span className="text-sm font-medium leading-none flex items-center gap-1">
                                   {cap.label}
                                   <InfoTip>
                                     <p className="text-sm text-muted-foreground">
                                       {cap.tip}
                                     </p>
                                   </InfoTip>
-                                </label>
-                              </div>
+                                </span>
+                              </label>
                             ))}
                           </div>
                         </div>
                       )}
 
-                      {/* Catalog Metadata Section */}
+                      {/* Display Metadata Section */}
                       <div className="border-t pt-4">
                         <div className="flex items-center gap-1 mb-3">
                           <label className="text-sm text-gray-600 font-medium">
-                            Catalog Metadata
+                            Display Metadata
                           </label>
                           <InfoTip>
                             <p className="text-sm text-muted-foreground">
-                              Display metadata shown in the model catalog.
+                              Display metadata shown on the public models page.
                               These fields are informational and do not affect
                               model behavior.
                             </p>
@@ -818,7 +872,7 @@ const ModelInfo: React.FC = () => {
                         <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
                           <div>
                             <label className="text-sm text-gray-600 mb-2 block">
-                              Provider
+                              Provider Key
                             </label>
                             <Input
                               value={updateData.metadata?.provider ?? ""}
@@ -827,12 +881,17 @@ const ModelInfo: React.FC = () => {
                                   ...prev,
                                   metadata: {
                                     ...prev.metadata,
-                                    provider: e.target.value || undefined,
+                                    provider:
+                                      e.target.value.trim().toLowerCase() ||
+                                      undefined,
                                   },
                                 }))
                               }
-                              placeholder="e.g. OpenAI, Alibaba"
+                              placeholder="e.g. openai, anthropic, alibaba"
                             />
+                            <p className="text-xs text-gray-400 mt-1">
+                              Matches the global provider config by key.
+                            </p>
                           </div>
                           <div>
                             <label className="text-sm text-gray-600 mb-2 block">
@@ -881,6 +940,41 @@ const ModelInfo: React.FC = () => {
                         <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mt-4">
                           <div>
                             <label className="text-sm text-gray-600 mb-2 block">
+                              Display Category
+                            </label>
+                            <Select
+                              value={updateData.metadata?.display_category ?? "__unset__"}
+                              onValueChange={(value) =>
+                                setUpdateData((prev) => ({
+                                  ...prev,
+                                  metadata: {
+                                    ...prev.metadata,
+                                    display_category:
+                                      value === "__unset__"
+                                        ? undefined
+                                        : (value as ModelDisplayCategory),
+                                  },
+                                }))
+                              }
+                            >
+                              <SelectTrigger>
+                                <SelectValue placeholder="Use model type defaults" />
+                              </SelectTrigger>
+                              <SelectContent>
+                                <SelectItem value="__unset__">Use model type defaults</SelectItem>
+                                {DISPLAY_CATEGORY_OPTIONS.map((option) => (
+                                  <SelectItem key={option.value} value={option.value}>
+                                    {option.label}
+                                  </SelectItem>
+                                ))}
+                              </SelectContent>
+                            </Select>
+                            <p className="text-xs text-gray-400 mt-1">
+                              Controls which catalog tab this model appears in.
+                            </p>
+                          </div>
+                          <div>
+                            <label className="text-sm text-gray-600 mb-2 block">
                               Intelligence Index
                             </label>
                             <Input
@@ -918,6 +1012,80 @@ const ModelInfo: React.FC = () => {
                                 }))
                               }
                               placeholder="e.g. artificial_analysis"
+                            />
+                          </div>
+                        </div>
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mt-4">
+                          <div>
+                            <label className="text-sm text-gray-600 mb-2 block">
+                              Quantization
+                            </label>
+                            <Input
+                              value={updateData.metadata?.quantization ?? ""}
+                              onChange={(e) =>
+                                setUpdateData((prev) => ({
+                                  ...prev,
+                                  metadata: {
+                                    ...prev.metadata,
+                                    quantization: e.target.value.toUpperCase() || undefined,
+                                  },
+                                }))
+                              }
+                              placeholder="e.g. FP8, FP16, INT4"
+                            />
+                          </div>
+                          <div>
+                            <label className="text-sm text-gray-600 mb-2 block">
+                              Deployment Providers
+                            </label>
+                            <Input
+                              value={
+                                ((updateData.metadata?.extra as Record<string, unknown>)?.deployment_providers as string[] | undefined)?.join(", ") ?? ""
+                              }
+                              onChange={(e) =>
+                                setUpdateData((prev) => ({
+                                  ...prev,
+                                  metadata: {
+                                    ...prev.metadata,
+                                    extra: {
+                                      ...(prev.metadata?.extra ?? {}),
+                                      deployment_providers: e.target.value
+                                        ? e.target.value.toLowerCase().split(",").map((s) => s.trim()).filter(Boolean)
+                                        : undefined,
+                                    },
+                                  },
+                                }))
+                              }
+                              placeholder="e.g. snowflake, onwards"
+                            />
+                          </div>
+                        </div>
+                        <div className="grid grid-cols-1 md:grid-cols-1 gap-4 mt-4">
+                          <div>
+                            <label className="text-sm text-gray-600 mb-2 block">
+                              Model Order
+                            </label>
+                            <Input
+                              type="number"
+                              step="1"
+                              value={
+                                (updateData.metadata?.extra as Record<string, unknown>)?.model_order as number ?? ""
+                              }
+                              onChange={(e) =>
+                                setUpdateData((prev) => ({
+                                  ...prev,
+                                  metadata: {
+                                    ...prev.metadata,
+                                    extra: {
+                                      ...(prev.metadata?.extra ?? {}),
+                                      model_order: e.target.value
+                                        ? parseInt(e.target.value, 10)
+                                        : undefined,
+                                    },
+                                  },
+                                }))
+                              }
+                              placeholder="Lower numbers appear first"
                             />
                           </div>
                         </div>
@@ -1750,18 +1918,18 @@ const ModelInfo: React.FC = () => {
                               {[
                                 { id: "vision", label: "Vision", tip: "Enables image upload in the playground." },
                                 { id: "reasoning", label: "Reasoning", tip: "Model supports extended reasoning / chain-of-thought." },
+                                { id: "enhanced_structured_generation", label: "Enhanced Structured Generation", tip: "Model supports enhanced generation for complex schema generation." },
                               ].map((cap) => (
                                 <div key={cap.id} className="flex items-center justify-between">
-                                  <div className="flex items-center space-x-2">
-                                    <input
-                                      type="checkbox"
+                                  <label className="flex items-center gap-2 text-sm">
+                                    <Checkbox
                                       id={`${cap.id}-capability-readonly`}
                                       checked={
                                         model.capabilities?.includes(cap.id) ??
                                         false
                                       }
-                                      onChange={async (e) => {
-                                        const newCapabilities = e.target.checked
+                                      onCheckedChange={async (checked) => {
+                                        const newCapabilities = checked
                                           ? [
                                               ...(model.capabilities || []),
                                               cap.id,
@@ -1785,41 +1953,45 @@ const ModelInfo: React.FC = () => {
                                         }
                                       }}
                                       disabled={updateModelMutation.isPending}
-                                      className="h-4 w-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500 disabled:opacity-50"
                                     />
-                                    <label
-                                      htmlFor={`${cap.id}-capability-readonly`}
-                                      className="text-sm font-medium leading-none peer-disabled:cursor-not-allowed peer-disabled:opacity-70 flex items-center gap-1"
-                                    >
+                                    <span className="text-sm font-medium leading-none flex items-center gap-1">
                                       {cap.label}
                                       <InfoTip>
                                         <p className="text-sm text-muted-foreground">
                                           {cap.tip}
                                         </p>
                                       </InfoTip>
-                                    </label>
-                                  </div>
+                                    </span>
+                                  </label>
                                 </div>
                               ))}
                             </div>
                           </div>
                         )}
 
-                      {/* Catalog Metadata Display */}
+                      {/* Display Metadata */}
                       {model.metadata && (
                         <div className="border-t pt-6">
                           <div className="flex items-center gap-1 mb-3">
                             <p className="text-sm text-gray-600 font-medium">
-                              Catalog Metadata
+                              Display Metadata
                             </p>
                           </div>
                           <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-                            {model.metadata.provider && (
-                              <div>
-                                <p className="text-xs text-gray-400 mb-1">Provider</p>
+                          {model.metadata.provider && (
+                            <div>
+                                <p className="text-xs text-gray-400 mb-1">Provider Key</p>
                                 <p className="text-sm font-medium">{model.metadata.provider}</p>
-                              </div>
-                            )}
+                            </div>
+                          )}
+                          {model.metadata.display_category && (
+                            <div>
+                                <p className="text-xs text-gray-400 mb-1">Display Category</p>
+                                <p className="text-sm font-medium capitalize">
+                                  {model.metadata.display_category}
+                                </p>
+                            </div>
+                          )}
                             {model.metadata.context_window != null && (
                               <div>
                                 <p className="text-xs text-gray-400 mb-1">Context Window</p>
@@ -1852,6 +2024,26 @@ const ModelInfo: React.FC = () => {
                               <div>
                                 <p className="text-xs text-gray-400 mb-1">Attribution</p>
                                 <p className="text-sm font-medium">{model.metadata.attribution}</p>
+                              </div>
+                            )}
+                            {model.metadata.quantization && (
+                              <div>
+                                <p className="text-xs text-gray-400 mb-1">Quantization</p>
+                                <p className="text-sm font-medium">{model.metadata.quantization}</p>
+                              </div>
+                            )}
+                            {model.metadata.extra?.deployment_providers && model.metadata.extra.deployment_providers.length > 0 && (
+                              <div>
+                                <p className="text-xs text-gray-400 mb-1">Deployment Providers</p>
+                                <p className="text-sm font-medium">{model.metadata.extra.deployment_providers.join(", ")}</p>
+                              </div>
+                            )}
+                            {model.metadata.extra?.model_order != null && (
+                              <div>
+                                <p className="text-xs text-gray-400 mb-1">Model Order</p>
+                                <p className="text-sm font-medium tabular-nums">
+                                  {model.metadata.extra.model_order}
+                                </p>
                               </div>
                             )}
                           </div>
@@ -1991,7 +2183,10 @@ const ModelInfo: React.FC = () => {
                                 >
                                   <div className="flex items-center gap-2 mb-2">
                                     <p className="font-medium text-sm">
-                                      {tariff.name}
+                                      {getTariffDisplayName(
+                                        tariff.api_key_purpose,
+                                        tariff.completion_window,
+                                      )}
                                     </p>
                                     <span className="text-xs text-gray-500 ml-auto">
                                       Valid from{" "}
@@ -2440,6 +2635,19 @@ const ModelInfo: React.FC = () => {
         modelName={model.alias}
         onClose={() => setShowPricingModal(false)}
       />
+
+      {/* Delete Virtual Model Modal */}
+      {model.is_composite && (
+        <DeleteVirtualModelModal
+          isOpen={showDeleteVirtualModal}
+          onClose={() => setShowDeleteVirtualModal(false)}
+          onSuccess={() => navigate(fromUrl || "/models/manage")}
+          modelId={model.id}
+          modelAlias={model.alias}
+          modelName={model.model_name}
+          componentCount={components?.length ?? 0}
+        />
+      )}
     </div>
   );
 };

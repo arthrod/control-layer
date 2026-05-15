@@ -41,12 +41,12 @@ import {
   useUpdateModelComponent,
   useRemoveModelComponent,
   useUpdateModel,
-  useModels,
   useConfig,
   type Model,
   type ModelComponent,
   type LoadBalancingStrategy,
 } from "../../../../api/control-layer";
+import { ModelCombobox } from "../../../ui/model-combobox";
 import { queryKeys } from "../../../../api/control-layer/keys";
 import {
   Card,
@@ -394,22 +394,29 @@ const AddProviderModal: React.FC<{
   modelId: string;
   existingComponentIds: string[];
   isPriorityMode: boolean;
-}> = ({ open, onClose, modelId, existingComponentIds, isPriorityMode }) => {
-  const [selectedModel, setSelectedModel] = useState<string>("");
+  strictModeEnabled: boolean;
+}> = ({
+  open,
+  onClose,
+  modelId,
+  existingComponentIds,
+  isPriorityMode,
+  strictModeEnabled,
+}) => {
+  const [selectedModel, setSelectedModel] = useState<Model | null>(null);
   const [weight, setWeight] = useState<string>("50");
-
-  const { data: modelsData, isLoading: modelsLoading } = useModels({
-    limit: 100,
-    accessible: false,
-  });
+  const [trusted, setTrusted] = useState<string>("untrusted");
 
   const addMutation = useAddModelComponent();
+  const updateModelMutation = useUpdateModel();
 
-  // Filter out composite models and already added models
-  const availableModels =
-    modelsData?.data?.filter(
-      (m) => !m.is_composite && !existingComponentIds.includes(m.id),
-    ) || [];
+  // Excludes composite models (a virtual model can't include another virtual
+  // as a component) and any models already added to this composite. The
+  // combobox handles searching/filtering across the full model list.
+  const filterAvailableModels = React.useCallback(
+    (m: Model) => !m.is_composite && !existingComponentIds.includes(m.id),
+    [existingComponentIds],
+  );
 
   const handleSubmit = async () => {
     if (!selectedModel) return;
@@ -418,16 +425,24 @@ const AddProviderModal: React.FC<{
       await addMutation.mutateAsync({
         modelId,
         data: {
-          deployed_model_id: selectedModel,
+          deployed_model_id: selectedModel.id,
           // New components are added at the end of the priority order
           sort_order: existingComponentIds.length,
           // Only include weight for weighted_random mode
           ...(isPriorityMode ? {} : { weight: parseInt(weight, 10) }),
         },
       });
+      // Set trusted flag if strict mode is enabled
+      if (strictModeEnabled) {
+        await updateModelMutation.mutateAsync({
+          id: selectedModel.id,
+          data: { trusted: trusted === "trusted" },
+        });
+      }
       onClose();
-      setSelectedModel("");
+      setSelectedModel(null);
       setWeight("50");
+      setTrusted("untrusted");
     } catch {
       // Error handled by mutation
     }
@@ -435,8 +450,9 @@ const AddProviderModal: React.FC<{
 
   const handleClose = () => {
     onClose();
-    setSelectedModel("");
+    setSelectedModel(null);
     setWeight("50");
+    setTrusted("untrusted");
   };
 
   return (
@@ -454,36 +470,16 @@ const AddProviderModal: React.FC<{
             <label className="text-sm font-medium text-gray-700">
               Select Model
             </label>
-            {modelsLoading ? (
-              <div className="flex items-center justify-center p-4">
-                <div className="animate-spin rounded-full h-6 w-6 border-b-2 border-gray-600" />
-              </div>
-            ) : availableModels.length === 0 ? (
-              <div className="p-4 text-center text-sm text-gray-500 bg-gray-50 rounded-lg">
-                No available models. All hosted models are either virtual or
-                already added.
-              </div>
-            ) : (
-              <Select value={selectedModel} onValueChange={setSelectedModel}>
-                <SelectTrigger>
-                  <SelectValue placeholder="Choose a model..." />
-                </SelectTrigger>
-                <SelectContent>
-                  {availableModels.map((model) => (
-                    <SelectItem key={model.id} value={model.id}>
-                      <div className="flex flex-col">
-                        <span>{model.alias}</span>
-                        {model.model_name !== model.alias && (
-                          <span className="text-xs text-gray-500">
-                            {model.model_name}
-                          </span>
-                        )}
-                      </div>
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            )}
+            <ModelCombobox
+              value={selectedModel}
+              onValueChange={setSelectedModel}
+              placeholder="Choose a hosted model…"
+              searchPlaceholder="Search by alias, model name, or endpoint…"
+              emptyMessage="No matching hosted models. (Already-added or virtual models are hidden.)"
+              filterFn={filterAvailableModels}
+              queryOptions={{ accessible: false, is_composite: false }}
+              className="w-full"
+            />
           </div>
 
           {/* Weight field - only for weighted distribution mode */}
@@ -514,6 +510,48 @@ const AddProviderModal: React.FC<{
                 placeholder="1-100"
               />
               <p className="text-xs text-gray-500">Value from 1 to 100.</p>
+            </div>
+          )}
+
+          {/* Trust level - only in strict mode */}
+          {strictModeEnabled && (
+            <div className="space-y-2">
+              <div className="flex items-center gap-1">
+                <label className="text-sm font-medium text-gray-700">
+                  Trust Level
+                </label>
+                <HoverCard openDelay={100} closeDelay={50}>
+                  <HoverCardTrigger asChild>
+                    <Info className="h-3 w-3 text-gray-400 hover:text-gray-600 cursor-help" />
+                  </HoverCardTrigger>
+                  <HoverCardContent className="w-64" sideOffset={5}>
+                    <p className="text-sm text-muted-foreground">
+                      Trusted providers bypass error sanitization, returning full
+                      error details from the upstream provider. Untrusted
+                      providers have their errors sanitized.
+                    </p>
+                  </HoverCardContent>
+                </HoverCard>
+              </div>
+              <Select value={trusted} onValueChange={setTrusted}>
+                <SelectTrigger>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="untrusted">
+                    <div className="flex items-center gap-2">
+                      <ShieldOff className="h-4 w-4 text-gray-400" />
+                      <span>Untrusted</span>
+                    </div>
+                  </SelectItem>
+                  <SelectItem value="trusted">
+                    <div className="flex items-center gap-2">
+                      <Shield className="h-4 w-4 text-blue-600" />
+                      <span>Trusted</span>
+                    </div>
+                  </SelectItem>
+                </SelectContent>
+              </Select>
             </div>
           )}
         </div>
@@ -1423,6 +1461,7 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
         modelId={model.id}
         existingComponentIds={components?.map((c) => c.model.id) || []}
         isPriorityMode={isPriorityMode}
+        strictModeEnabled={strictModeEnabled}
       />
 
       <EditWeightModal

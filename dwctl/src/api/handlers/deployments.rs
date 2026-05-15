@@ -469,7 +469,8 @@ pub async fn create_deployed_model<P: PoolProvider>(
         DeployedModelCreate::Composite(c) => &c.allowed_batch_completion_windows,
     };
     if let Some(windows) = batch_windows {
-        let allowed = &state.config.batches.allowed_completion_windows;
+        let config = state.current_config();
+        let allowed = &config.batches.allowed_completion_windows;
         for window in windows {
             if !allowed.contains(window) {
                 return Err(Error::BadRequest {
@@ -600,7 +601,8 @@ pub async fn update_deployed_model<P: PoolProvider>(
 
     // Validate allowed batch completion windows against global config
     if let Some(Some(windows)) = &update.allowed_batch_completion_windows {
-        let allowed = &state.config.batches.allowed_completion_windows;
+        let config = state.current_config();
+        let allowed = &config.batches.allowed_completion_windows;
         for window in windows {
             if !allowed.contains(window) {
                 return Err(Error::BadRequest {
@@ -839,24 +841,21 @@ pub async fn get_deployed_model<P: PoolProvider>(
 
     for &include in &all_includes {
         match include {
-            "groups" => {
+            "groups"
                 // Only users with Groups::ReadAll can include groups
-                if can_read_groups {
+                if can_read_groups => {
                     include_groups = true;
                 }
-            }
-            "metrics" => {
+            "metrics"
                 // Only users with Analytics::ReadAll can include metrics
-                if can_read_metrics {
+                if can_read_metrics => {
                     include_metrics = true;
                 }
-            }
-            "endpoints" => {
+            "endpoints"
                 // Model endpoints is priviliged information for admins
-                if can_read_all_models {
+                if can_read_all_models => {
                     include_endpoints = true;
                 }
-            }
             "status" => {
                 // Status is allowed for all users
                 include_status = true;

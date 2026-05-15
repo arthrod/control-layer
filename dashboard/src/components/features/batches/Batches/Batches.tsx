@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import * as React from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { useQueryClient } from "@tanstack/react-query";
@@ -10,6 +10,11 @@ import {
   FileCheck,
   AlertCircle,
   X,
+  Users,
+  ChevronsUpDown,
+  Check,
+  Filter,
+  Code,
 } from "lucide-react";
 import { Button } from "../../../ui/button";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "../../../ui/tabs";
@@ -20,17 +25,54 @@ import {
   SelectTrigger,
   SelectValue,
 } from "../../../ui/select";
+import {
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+} from "../../../ui/popover";
+import {
+  Command,
+  CommandEmpty,
+  CommandGroup,
+  CommandInput,
+  CommandItem,
+  CommandList,
+} from "../../../ui/command";
+import { Switch } from "../../../ui/switch";
+import { DateTimeRangeSelector } from "../../../ui/date-time-range-selector";
 import { DataTable } from "../../../ui/data-table";
 import { createFileColumns } from "../FilesTable/columns";
 import { createBatchColumns } from "../BatchesTable/columns";
-import { useFiles, useBatches } from "../../../../api/control-layer/hooks";
+import {
+  useFiles,
+  useBatches,
+  useOrganizationMembers,
+  useUsers,
+  useConfig,
+} from "../../../../api/control-layer/hooks";
 import { dwctlApi } from "../../../../api/control-layer/client";
 import type { FileObject, Batch } from "../types";
-import type { BatchAnalytics } from "../../../../api/control-layer/types";
+import type {
+  BatchStatus,
+} from "../../../../api/control-layer/types";
 import { useServerCursorPagination } from "../../../../hooks/useServerCursorPagination";
 import { useDebounce } from "../../../../hooks/useDebounce";
+import { usePersistedFilter } from "../../../../hooks/usePersistedFilter";
 import { useAuthorization } from "../../../../utils/authorization";
+import { useOrganizationContext } from "../../../../contexts/organization/useOrganizationContext";
 import { useBootstrapContent } from "@/hooks/use-bootstrap-content";
+import { ApiExamples } from "../../../modals";
+import { cn } from "@/lib/utils";
+
+// Window strings forwarded as-is to the backend `completion_window` filter.
+// Async uses the configurable async window (default "1h"); regular batch jobs
+// use "24h". Realtime tracking rows ("0s") are intentionally omitted from
+// the UI selector — they're queryable via the API but live on the Responses
+// page in the dashboard.
+const BATCH_COMPLETION_WINDOW = "24h";
+const DEFAULT_COMPLETION_WINDOWS: string[] = [BATCH_COMPLETION_WINDOW];
+
+const PERSIST_SCOPE = "batches";
 
 /**
  * Props for the Batches component.
@@ -64,17 +106,145 @@ export function Batches({
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
   const queryClient = useQueryClient();
-  const { userRoles } = useAuthorization();
+  const { userRoles, hasPermission } = useAuthorization();
+  const { isOrgContext, activeOrganizationId } = useOrganizationContext();
+  const { data: appConfig } = useConfig();
+  const asyncCompletionWindow =
+    appConfig?.batches?.async_requests?.completion_window ?? "1h";
 
-  // PlatformManagers can see all batches, so show the User column for them
+  // Show User column for PlatformManagers (see all batches) or in org context (see org members)
   const isPlatformManager = userRoles.includes("PlatformManager");
+  const showUserColumn = isPlatformManager || isOrgContext;
+  // Context and Source columns are used by the file table only
+  const showContextColumn = isPlatformManager;
+  const showSourceColumn = hasPermission("connections");
+
+  // Member filter:
+  // - Org context (all users): show org members dropdown (client-side filtered)
+  // - Personal context (PM only): show users via server-side search
+  const showMemberFilter = isOrgContext || (isPlatformManager && !isOrgContext);
+  const useServerSideMemberSearch = isPlatformManager && !isOrgContext;
+  const { data: orgMembers } = useOrganizationMembers(
+    activeOrganizationId || "",
+  );
+
+  // Server-side user search for PM personal mode
+  const [memberSearch, setMemberSearch] = useState("");
+  const debouncedMemberSearch = useDebounce(memberSearch, 300);
+  const { data: searchedUsers } = useUsers({
+    search: debouncedMemberSearch,
+    limit: 50,
+    enabled: useServerSideMemberSearch,
+  });
+
+  const memberList = React.useMemo(() => {
+    // Org context: show org members (client-side filtered by Command)
+    if (isOrgContext && orgMembers) {
+      return orgMembers
+        .filter((m) => m.status === "active" && m.user)
+        .map((m) => ({ id: m.user!.id, email: m.user!.email }));
+    }
+    // Personal context + PM: show server-side searched users.
+    // Deduplicate by email (a user may appear twice if they have both personal
+    // and org-created individual records). The personal member_id is used under
+    // the hood — the backend expands it to cover both personal and org contexts.
+    if (useServerSideMemberSearch && searchedUsers?.data) {
+      const seen = new Set<string>();
+      return searchedUsers.data
+        .filter((u) => u.user_type !== "organization")
+        .filter((u) => {
+          if (seen.has(u.email)) return false;
+          seen.add(u.email);
+          return true;
+        })
+        .map((u) => ({ id: u.id, email: u.email }));
+    }
+    return [];
+  }, [isOrgContext, useServerSideMemberSearch, orgMembers, searchedUsers]);
+
+  // Member filter — only the id is persisted. The email is PII and there's
+  // no need to keep coworker addresses in localStorage on a shared
+  // workstation; we re-resolve it from `memberList` on render and fall back
+  // to the id while the list loads. Empty string = no filter.
+  const [selectedMemberId, setSelectedMemberId] = usePersistedFilter(
+    PERSIST_SCOPE,
+    "member",
+    "",
+  );
+  const [memberPopoverOpen, setMemberPopoverOpen] = useState(false);
+
+  // Batch-specific filters
+  const [statusFilter, setStatusFilter] = usePersistedFilter(
+    PERSIST_SCOPE,
+    "status",
+    "all",
+  );
+  // Completion-window multi-select. Maps directly to the backend
+  // `completion_window` query param (comma-separated). Default hides the
+  // realtime tracking rows ("0s") and async/flex requests ("1h") that the
+  // Open Responses API creates — those have their own page in Async Requests.
+  const [completionWindowFilter, setCompletionWindowFilter] = usePersistedFilter(
+    PERSIST_SCOPE,
+    "window",
+    DEFAULT_COMPLETION_WINDOWS,
+  );
+  const [sortActiveFirstStr, setSortActiveFirstStr] = usePersistedFilter(
+    PERSIST_SCOPE,
+    "activeFirst",
+    "true",
+  );
+  const sortActiveFirst = sortActiveFirstStr !== "false";
+  const setSortActiveFirst = (next: boolean) =>
+    setSortActiveFirstStr(next ? "true" : "false");
+  // Date range is intentionally not persisted — bringing back stale absolute
+  // timestamps on a later visit would be confusing.
+  const [dateRange, setDateRange] = useState<
+    { from: Date; to: Date } | undefined
+  >(undefined);
+
+  // Clear member + status filters and reset pagination when org context changes
+  // (member filter is org-scoped). Other persisted filters are intentionally left
+  // alone — they describe how the user wants to view their data, not who they're
+  // viewing it for.
+  //
+  // Skip the very first run: on mount activeOrganizationId is whatever it
+  // happens to be, and treating that as a "change" would wipe a freshly
+  // restored persisted member id before it ever reaches the API.
+  const isInitialOrgMount = useRef(true);
+  useEffect(() => {
+    if (isInitialOrgMount.current) {
+      isInitialOrgMount.current = false;
+      return;
+    }
+    setSelectedMemberId("");
+    setMemberSearch("");
+    setStatusFilter("all");
+    setDateRange(undefined);
+    filesPagination.handleFirstPage();
+    batchesPagination.handleFirstPage();
+    // Also clear file filter from URL
+    setSearchParams((prev) => {
+      const params = new URLSearchParams(prev);
+      params.delete("fileFilter");
+      return params;
+    }, { replace: true });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeOrganizationId]);
 
   // Drag and drop state (kept locally as it's UI-only)
   const [dragActive, setDragActive] = useState(false);
 
   // Search state for files and batches (server-side)
-  const [fileSearchQuery, setFileSearchQuery] = useState("");
-  const [batchSearchQuery, setBatchSearchQuery] = useState("");
+  const [fileSearchQuery, setFileSearchQuery] = usePersistedFilter(
+    PERSIST_SCOPE,
+    "fileSearch",
+    "",
+  );
+  const [batchSearchQuery, setBatchSearchQuery] = usePersistedFilter(
+    PERSIST_SCOPE,
+    "batchSearch",
+    "",
+  );
   const debouncedFileSearch = useDebounce(fileSearchQuery, 300);
   const debouncedBatchSearch = useDebounce(batchSearchQuery, 300);
 
@@ -139,19 +309,48 @@ export function Batches({
         ? "batch_output"
         : "batch_error"; // error
 
+  // In an org context the resolved memberList is authoritative — if the
+  // persisted id isn't in it (e.g. user switched orgs in another tab or the
+  // member was removed), drop the filter rather than sending a stale id that
+  // returns nothing. PM personal mode searches users on demand, so we can't
+  // make that determination there without an extra round trip; trust the id.
+  const memberKnown =
+    !selectedMemberId || memberList.some((m) => m.id === selectedMemberId);
+  const memberIdFilter =
+    selectedMemberId && (!isOrgContext || memberKnown)
+      ? selectedMemberId
+      : undefined;
+  const resolvedMemberEmail = memberList.find(
+    (m) => m.id === selectedMemberId,
+  )?.email;
+
   const { data: filesResponse, isLoading: filesLoading } = useFiles({
     purpose: filePurpose,
     search: debouncedFileSearch.trim() || undefined,
+    member_id: memberIdFilter,
     ...filesPagination.queryParams,
     enabled: activeTab === "files" || !!batchFileFilter,
   });
+
+  // Empty selection means "no filter" — same UX as AsyncRequests so the user
+  // can't accidentally end up with a query that matches nothing.
+  const completionWindowParam =
+    completionWindowFilter.length > 0
+      ? completionWindowFilter.join(",")
+      : undefined;
 
   // Paginated batches query - include analytics to avoid N+1 requests
   const { data: batchesResponse, isLoading: batchesLoading } = useBatches({
     search: debouncedBatchSearch.trim() || undefined,
     include: "analytics",
+    member_id: memberIdFilter,
+    status:
+      statusFilter !== "all" ? (statusFilter as BatchStatus) : undefined,
+    created_after: dateRange?.from.toISOString(),
+    created_before: dateRange?.to.toISOString(),
+    active_first: sortActiveFirst || undefined,
+    completion_window: completionWindowParam,
     ...batchesPagination.queryParams,
-    // Always fetch to populate tab counts, but refetch interval is lower when not active
   });
 
   // Process batches response - remove extra item used for hasMore detection
@@ -171,22 +370,17 @@ export function Batches({
   // Display files as returned by API (server-side filtered by purpose)
   const files = filesForDisplay;
 
-  // Filter batches by input file if filter is set
+  // Apply client-side filters to batches (sorting is now server-side via active_first param)
   const filteredBatches = React.useMemo(() => {
-    if (!batchFileFilter) return batches;
-    return batches.filter((b) => b.input_file_id === batchFileFilter);
-  }, [batches, batchFileFilter]);
+    let result = batches;
 
-  // Create a map of batch ID to analytics for easy lookup (analytics are now embedded in batch response)
-  const batchAnalyticsMap = React.useMemo(() => {
-    const map = new Map<string, BatchAnalytics>();
-    batches.forEach((batch) => {
-      if (batch.analytics) {
-        map.set(batch.id, batch.analytics);
-      }
-    });
-    return map;
-  }, [batches]);
+    // Filter by input file (client-side, from file detail view)
+    if (batchFileFilter) {
+      result = result.filter((b) => b.input_file_id === batchFileFilter);
+    }
+
+    return result;
+  }, [batches, batchFileFilter]);
 
   // Prefetch next page for files - only if user has already started paginating
   useEffect(() => {
@@ -196,6 +390,8 @@ export function Batches({
 
       const prefetchOptions = {
         purpose: filePurpose,
+        search: debouncedFileSearch.trim() || undefined,
+        member_id: memberIdFilter,
         limit: filesPagination.pageSize + 1,
         after: nextCursor,
       };
@@ -211,6 +407,8 @@ export function Batches({
     filesPagination.page,
     filesPagination.pageSize,
     filePurpose,
+    debouncedFileSearch,
+    memberIdFilter,
     queryClient,
   ]);
 
@@ -220,17 +418,23 @@ export function Batches({
       const lastBatch = batches[batches.length - 1];
       const nextCursor = lastBatch.id;
 
+      const prefetchOptions = {
+        search: debouncedBatchSearch.trim() || undefined,
+        include: "analytics" as const,
+        member_id: memberIdFilter,
+        status:
+          statusFilter !== "all" ? (statusFilter as BatchStatus) : undefined,
+        created_after: dateRange?.from.toISOString(),
+        created_before: dateRange?.to.toISOString(),
+        active_first: sortActiveFirst || undefined,
+        completion_window: completionWindowParam,
+        limit: batchesPagination.pageSize + 1,
+        after: nextCursor,
+      };
+
       queryClient.prefetchQuery({
-        queryKey: [
-          "batches",
-          "list",
-          { limit: batchesPagination.pageSize + 1, after: nextCursor },
-        ],
-        queryFn: () =>
-          dwctlApi.batches.list({
-            limit: batchesPagination.pageSize + 1,
-            after: nextCursor,
-          }),
+        queryKey: ["batches", "list", prefetchOptions],
+        queryFn: () => dwctlApi.batches.list(prefetchOptions),
       });
     }
   }, [
@@ -238,6 +442,12 @@ export function Batches({
     batchesHasMore,
     batchesPagination.page,
     batchesPagination.pageSize,
+    completionWindowParam,
+    debouncedBatchSearch,
+    memberIdFilter,
+    statusFilter,
+    dateRange,
+    sortActiveFirst,
     queryClient,
   ]);
 
@@ -381,6 +591,9 @@ export function Batches({
     onTriggerBatch: handleTriggerBatch,
     onViewBatches: handleFileClick,
     isFileInProgress,
+    showUserColumn,
+    showContextColumn,
+    showSourceColumn,
   });
 
   const handleBatchClick = (batch: Batch) => {
@@ -398,12 +611,104 @@ export function Batches({
     onViewFile: handleViewFileRequests,
     getInputFile,
     onRowClick: handleBatchClick,
-    batchAnalytics: batchAnalyticsMap,
-    showUserColumn: isPlatformManager,
+    showUserColumn,
+    // Always show the type column now — its purpose is to disambiguate the
+    // three completion-window classes when more than one is selected.
+    showTypeColumn: true,
+    asyncCompletionWindow,
   });
 
+  // Searchable member filter combobox - shared between batches and files tabs
+  // The email is resolved from the live memberList (we only persist the id),
+  // so we fall back to a generic placeholder while the list is loading.
+  const displayedMemberEmail = resolvedMemberEmail;
+  const memberLabel =
+    !selectedMemberId
+      ? "All members"
+      : displayedMemberEmail || "Selected member";
+  // Show member filter: always for PM personal mode (server-side search),
+  // only when org members exist for org context (client-side filtered)
+  const showMemberCombobox =
+    showMemberFilter &&
+    (useServerSideMemberSearch || memberList.length > 0);
+  const memberFilterCombobox = showMemberCombobox && (
+    <Popover open={memberPopoverOpen} onOpenChange={setMemberPopoverOpen}>
+      <PopoverTrigger asChild>
+        <Button
+          variant="outline"
+          role="combobox"
+          aria-expanded={memberPopoverOpen}
+          className="w-[220px] h-9 justify-between font-normal"
+        >
+          <div className="flex items-center gap-1.5 truncate">
+            <Users className="w-3.5 h-3.5 shrink-0 text-gray-500" />
+            <span className="truncate">{memberLabel}</span>
+          </div>
+          <ChevronsUpDown className="ml-1 h-3.5 w-3.5 shrink-0 opacity-50" />
+        </Button>
+      </PopoverTrigger>
+      <PopoverContent className="w-[280px] p-0" align="start">
+        <Command shouldFilter={!useServerSideMemberSearch}>
+          <CommandInput
+            placeholder="Search by email..."
+            value={useServerSideMemberSearch ? memberSearch : undefined}
+            onValueChange={
+              useServerSideMemberSearch ? setMemberSearch : undefined
+            }
+          />
+          <CommandList>
+            <CommandEmpty>No members found.</CommandEmpty>
+            <CommandGroup>
+              <CommandItem
+                value="all-members"
+                onSelect={() => {
+                  setSelectedMemberId("");
+                  setMemberSearch("");
+                  setMemberPopoverOpen(false);
+                  batchesPagination.handleFirstPage();
+                  filesPagination.handleFirstPage();
+                }}
+              >
+                <Check
+                  className={cn(
+                    "mr-2 h-4 w-4",
+                    !selectedMemberId ? "opacity-100" : "opacity-0",
+                  )}
+                />
+                All members
+              </CommandItem>
+              {memberList.map((member) => (
+                <CommandItem
+                  key={member.id}
+                  value={member.email}
+                  onSelect={() => {
+                    setSelectedMemberId(member.id);
+                    setMemberSearch("");
+                    setMemberPopoverOpen(false);
+                    batchesPagination.handleFirstPage();
+                    filesPagination.handleFirstPage();
+                  }}
+                >
+                  <Check
+                    className={cn(
+                      "mr-2 h-4 w-4",
+                      selectedMemberId === member.id
+                        ? "opacity-100"
+                        : "opacity-0",
+                    )}
+                  />
+                  <span className="truncate">{member.email}</span>
+                </CommandItem>
+              ))}
+            </CommandGroup>
+          </CommandList>
+        </Command>
+      </PopoverContent>
+    </Popover>
+  );
+
   const bootstrapBanner = useBootstrapContent();
-  console.log("bootstrapBanner", bootstrapBanner);
+  const [showApiExamples, setShowApiExamples] = useState(false);
 
   return (
     <div
@@ -419,11 +724,11 @@ export function Batches({
         className="space-y-4"
       >
         {/* Header with Tabs and Actions */}
-        <div className="mb-6 flex flex-col lg:flex-row lg:items-center lg:justify-between gap-4">
+        <div className="mb-4 flex flex-col sm:flex-row sm:items-end sm:justify-between gap-4">
           {/* Left: Title */}
-          <div className="shrink-0">
+          <div>
             <h1 className="text-3xl font-bold text-doubleword-neutral-900">
-              {activeTab === "batches" ? "Batch Requests" : "Batch Files"}
+              {activeTab === "batches" ? "Batches" : "Batch Files"}
             </h1>
             <p className="text-doubleword-neutral-600 mt-1">
               {activeTab === "batches"
@@ -433,13 +738,12 @@ export function Batches({
           </div>
 
           {/* Right: Buttons + Tabs */}
-          <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-3 lg:shrink-0">
+          <div className="flex items-center gap-2">
             {/* Action Button - changes based on active tab */}
             {activeTab === "batches" ? (
               <Button
                 onClick={() => onOpenCreateBatchModal()}
                 variant="outline"
-                className="flex-1 sm:flex-none"
               >
                 <Play className="w-4 h-4 mr-2" />
                 Create Batch
@@ -448,7 +752,7 @@ export function Batches({
               <Button
                 onClick={() => onOpenUploadModal()}
                 variant="outline"
-                className={`flex-1 sm:flex-none transition-all duration-200 ${
+                className={`transition-all duration-200 ${
                   dragActive ? "border-blue-500 bg-blue-50 text-blue-700" : ""
                 }`}
               >
@@ -457,18 +761,24 @@ export function Batches({
               </Button>
             )}
 
+            {/* API Button */}
+            <Button variant="outline" onClick={() => setShowApiExamples(true)}>
+              <Code className="h-4 w-4" />
+              API
+            </Button>
+
             {/* Tabs Selector */}
-            <TabsList className="w-full sm:w-auto">
+            <TabsList>
               <TabsTrigger
                 value="batches"
-                className="flex items-center gap-2 flex-1 sm:flex-none"
+                className="flex items-center gap-2"
               >
                 <Box className="w-4 h-4" />
                 Batches
               </TabsTrigger>
               <TabsTrigger
                 value="files"
-                className="flex items-center gap-2 flex-1 sm:flex-none"
+                className="flex items-center gap-2"
               >
                 <FileInput className="w-4 h-4" />
                 Files
@@ -531,7 +841,7 @@ export function Batches({
             pageSize={batchesPagination.pageSize}
             minRows={batchesPagination.pageSize}
             rowHeight="40px"
-            initialColumnVisibility={{ id: false }}
+            initialColumnVisibility={{ batch_id: false, input_file_id: false, completion_window: false }}
             onRowClick={handleBatchClick}
             isLoading={batchesLoading}
             emptyState={
@@ -563,7 +873,111 @@ export function Batches({
               </div>
             }
             headerActions={
-              <div className="flex items-center gap-2">
+              <div className="flex items-center gap-2 flex-wrap">
+                <div className="flex items-center gap-1.5">
+                  <Switch
+                    id="active-first"
+                    checked={sortActiveFirst}
+                    onCheckedChange={(checked) => {
+                      setSortActiveFirst(checked);
+                      batchesPagination.handleFirstPage();
+                    }}
+                  />
+                  <label
+                    htmlFor="active-first"
+                    className="text-sm text-gray-600 cursor-pointer select-none"
+                  >
+                    Active first
+                  </label>
+                </div>
+                <Popover>
+                  <PopoverTrigger asChild>
+                    <Button
+                      variant="outline"
+                      className="h-9 justify-between font-normal"
+                    >
+                      <div className="flex items-center gap-1.5 truncate">
+                        <Filter className="w-3.5 h-3.5 shrink-0 text-gray-500" />
+                        <span className="truncate">
+                          {completionWindowFilter.length === 0
+                            ? "All windows"
+                            : completionWindowFilter
+                                .map((w) =>
+                                  w === asyncCompletionWindow
+                                    ? "Async"
+                                    : w === BATCH_COMPLETION_WINDOW
+                                      ? "Batch"
+                                      : w,
+                                )
+                                .join(", ")}
+                        </span>
+                      </div>
+                      <ChevronsUpDown className="ml-1 h-3.5 w-3.5 shrink-0 opacity-50" />
+                    </Button>
+                  </PopoverTrigger>
+                  <PopoverContent className="w-[160px] p-2" align="start">
+                    {(
+                      [
+                        { window: BATCH_COMPLETION_WINDOW, label: "Batch" },
+                        { window: asyncCompletionWindow, label: "Async" },
+                      ] as const
+                    ).map(({ window, label }) => (
+                      <label
+                        key={window}
+                        className="flex items-center gap-2 px-2 py-1.5 text-sm cursor-pointer rounded hover:bg-gray-50"
+                      >
+                        <input
+                          type="checkbox"
+                          checked={completionWindowFilter.includes(window)}
+                          onChange={() => {
+                            setCompletionWindowFilter(
+                              completionWindowFilter.includes(window)
+                                ? completionWindowFilter.filter(
+                                    (w) => w !== window,
+                                  )
+                                : [...completionWindowFilter, window],
+                            );
+                            batchesPagination.handleFirstPage();
+                          }}
+                          className="rounded border-gray-300"
+                        />
+                        {label}
+                      </label>
+                    ))}
+                  </PopoverContent>
+                </Popover>
+                {memberFilterCombobox}
+                <Select
+                  value={statusFilter}
+                  onValueChange={(v) => {
+                    setStatusFilter(v);
+                    batchesPagination.handleFirstPage();
+                  }}
+                >
+                  <SelectTrigger className="w-[140px] h-9">
+                    <div className="flex items-center gap-1.5">
+                      <Filter className="w-3.5 h-3.5 text-gray-500" />
+                      <SelectValue />
+                    </div>
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="all">All statuses</SelectItem>
+                    <SelectItem value="in_progress">In Progress</SelectItem>
+                    <SelectItem value="completed">Completed</SelectItem>
+                    <SelectItem value="failed">Failed</SelectItem>
+                    <SelectItem value="cancelled">Cancelled</SelectItem>
+                    {isPlatformManager && (
+                      <SelectItem value="expired">Expired (SLA)</SelectItem>
+                    )}
+                  </SelectContent>
+                </Select>
+                <DateTimeRangeSelector
+                  value={dateRange}
+                  onChange={(range) => {
+                    setDateRange(range);
+                    batchesPagination.handleFirstPage();
+                  }}
+                />
                 <span className="text-sm text-gray-600">Rows:</span>
                 <Select
                   value={batchesPagination.pageSize.toString()}
@@ -571,7 +985,7 @@ export function Batches({
                     batchesPagination.handlePageSizeChange(Number(value))
                   }
                 >
-                  <SelectTrigger className="w-20p h-9">
+                  <SelectTrigger className="w-20 h-9">
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
@@ -641,7 +1055,8 @@ export function Batches({
               </div>
             }
             headerActions={
-              <div className="flex items-center gap-2">
+              <div className="flex items-center gap-2 flex-wrap">
+                {memberFilterCombobox}
                 <div className="inline-flex h-9 items-center justify-center rounded-md bg-muted p-1 text-muted-foreground">
                   {(["input", "output", "error"] as const).map((type) => {
                     const Icon =
@@ -731,6 +1146,12 @@ export function Batches({
           />
         </TabsContent>
       </Tabs>
+
+      <ApiExamples
+        isOpen={showApiExamples}
+        onClose={() => setShowApiExamples(false)}
+        defaultTab="batch"
+      />
     </div>
   );
 }

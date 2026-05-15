@@ -318,7 +318,11 @@ jsonpath "$.object" == "list"
 jsonpath "$.data" count == 1
 jsonpath "$.data[0].id" == "{{user2_thinking_file_id}}"
 
-# Admin sees all files (6 total: 3 from user1, 1 from user2, 2 from admin)
+# Admin sees all files (3 from user1 + 1 from user2 + 2 from admin = 6
+# explicit uploads). Responses are batchless on this branch, so the
+# `/v1/responses` path's `create_realtime` / `create_flex` calls no
+# longer mint synthetic per-request `files` rows like the old
+# `create_single_request_batch` did.
 GET http://localhost:3001/ai/v1/files
 [Cookies]
 dwctl_session: {{admin_jwt}}
@@ -435,8 +439,22 @@ HTTP 201
 user1_batch_id: jsonpath "$.id"
 [Asserts]
 jsonpath "$.input_file_id" == "{{user1_gpt4_file_id}}"
-jsonpath "$.status" == "in_progress"
+jsonpath "$.status" == "validating"
 jsonpath "$.endpoint" == "/v1/chat/completions"
+jsonpath "$.output_file_id" != null
+jsonpath "$.error_file_id" != null
+
+# Poll until the worker populates the batch and transitions to in_progress
+GET http://localhost:3001/ai/v1/batches/{{user1_batch_id}}
+[Options]
+retry: 10
+retry-interval: 500
+[Cookies]
+dwctl_session: {{user_jwt}}
+HTTP 200
+[Asserts]
+jsonpath "$.status" == "in_progress"
+jsonpath "$.request_counts.total" > 0
 
 # User1 CANNOT create batch from user2's file
 POST http://localhost:3001/ai/v1/batches
@@ -1133,7 +1151,7 @@ HTTP 201
 user1_revoke_test_batch_id: jsonpath "$.id"
 [Asserts]
 jsonpath "$.input_file_id" == "{{user1_revoke_test_file_id}}"
-jsonpath "$.status" == "in_progress"
+jsonpath "$.status" == "validating"
 
 # -----------------------------------------------------------------------------
 # Retrieve batch to get output and error file IDs (wait for processing to complete)

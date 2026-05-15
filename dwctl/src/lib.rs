@@ -143,9 +143,12 @@ fn install_crypto_provider() {
 pub mod api;
 pub mod auth;
 pub mod config;
+mod config_watcher;
+pub mod connections;
 mod crypto;
 pub mod db;
 mod email;
+pub mod encryption;
 mod error_enrichment;
 pub mod errors;
 mod leader_election;
@@ -156,10 +159,14 @@ mod openapi;
 mod payment_providers;
 mod probes;
 mod request_logging;
+pub mod responses;
 pub mod sample_files;
 mod static_assets;
 mod sync;
+pub mod tasks;
 pub mod telemetry;
+pub mod tool_executor;
+pub mod tool_injection;
 mod types;
 pub mod webhooks;
 
@@ -199,6 +206,7 @@ use outlet::{MultiHandler, RequestLoggerConfig, RequestLoggerLayer};
 use outlet_postgres::PostgresHandler;
 use request_logging::{AiResponse, ParsedAIRequest};
 use sqlx::{ConnectOptions, Executor, PgPool, postgres::PgConnectOptions};
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::{Arc, OnceLock};
 use tokio::net::TcpListener;
@@ -211,6 +219,29 @@ use utoipa_scalar::{Scalar, Servable};
 use uuid::Uuid;
 
 pub use types::{ApiKeyId, DeploymentId, GroupId, InferenceEndpointId, UserId};
+
+#[derive(Clone)]
+pub struct SharedConfig(Arc<arc_swap::ArcSwap<Config>>);
+
+impl SharedConfig {
+    pub fn new(config: Config) -> Self {
+        Self(Arc::new(arc_swap::ArcSwap::from_pointee(config)))
+    }
+
+    pub fn snapshot(&self) -> Arc<Config> {
+        self.0.load_full()
+    }
+
+    pub fn store(&self, config: Config) {
+        self.0.store(Arc::new(config));
+    }
+}
+
+impl From<Config> for SharedConfig {
+    fn from(config: Config) -> Self {
+        Self::new(config)
+    }
+}
 
 /// Application state shared across all request handlers.
 ///
@@ -233,7 +264,7 @@ pub use types::{ApiKeyId, DeploymentId, GroupId, InferenceEndpointId, UserId};
 /// let limiters = limits::Limiters::new(&config.limits);
 /// let state = AppState::builder()
 ///     .db(db_pools)
-///     .config(config)
+///     .config(config.into())
 ///     .request_manager(request_manager)
 ///     .limiters(limiters)
 ///     .build();
@@ -246,7 +277,7 @@ where
     /// Database pools (primary + optional replica).
     /// Use `.read()` for read-only queries, `.write()` for writes.
     pub db: P,
-    pub config: Config,
+    pub config: SharedConfig,
     /// Outlet database pools for request logging. Always uses DbPools (production type).
     /// In tests, this uses DbPools without read-only enforcement (outlet is write-heavy).
     pub outlet_db: Option<DbPools>,
@@ -254,8 +285,30 @@ where
     #[builder(default = false)]
     pub is_leader: bool,
     pub request_manager: Arc<fusillade::PostgresRequestManager<P, fusillade::ReqwestHttpClient>>,
+    /// Background task runner for enqueuing deferred work (batch population, etc.)
+    pub task_runner: Arc<tasks::TaskRunner<P>>,
     /// Resource limiters for protecting system capacity.
     pub limiters: limits::Limiters,
+    /// Encryption key for connection credentials, derived once at startup.
+    /// `None` means connections encryption is unavailable.
+    pub connections_encryption_key: Option<Vec<u8>>,
+    /// Response store for Open Responses API lifecycle tracking.
+    /// Reads/writes to fusillade's requests table.
+    pub response_store: Arc<crate::responses::store::FusilladeResponseStore<P>>,
+    /// Multi-step response_steps storage. Optional so deployments that
+    /// don't use the multi-step Open Responses path can omit the
+    /// wiring; the GET /v1/responses/{id} handler degrades to 404 in
+    /// that case rather than panicking.
+    pub response_step_manager: Option<Arc<fusillade::PostgresResponseStepManager<P>>>,
+}
+
+impl<P> AppState<P>
+where
+    P: PoolProvider + Clone,
+{
+    pub fn current_config(&self) -> Arc<Config> {
+        self.config.snapshot()
+    }
 }
 
 /// Get the dwctl database migrator
@@ -265,6 +318,7 @@ pub fn migrator() -> sqlx::migrate::Migrator {
 
 /// Global Prometheus handle - ensures recorder is only installed once
 static PROMETHEUS_HANDLE: OnceLock<PrometheusHandle> = OnceLock::new();
+static AXUM_PROMETHEUS_PREFIX_SET: OnceLock<()> = OnceLock::new();
 
 /// Get or install the Prometheus metrics recorder.
 ///
@@ -366,7 +420,7 @@ pub async fn create_initial_admin_user(
         // User exists - update password if provided
         if let Some(password_hash) = password_hash {
             // Update password using raw SQL since we don't have a password update method
-            sqlx::query!("UPDATE users SET password_hash = $1 WHERE email = $2", password_hash, email)
+            sqlx::query!("UPDATE users SET password_hash = $1 WHERE id = $2", password_hash, existing_user.id)
                 .execute(&mut *tx)
                 .await?;
         }
@@ -461,6 +515,7 @@ pub async fn seed_database(sources: &[config::ModelSource], db: &PgPool) -> Resu
                         DeployedModelCreate::Standard(StandardModelCreate {
                             model_name: model.name.clone(),
                             alias: Some(model.name.clone()),
+                            display_name: None,
                             hosted_on: endpoint_id,
                             description: None,
                             model_type: None,
@@ -741,6 +796,9 @@ async fn setup_database(
     };
     fusillade::migrator().run(&*fusillade_pools).await?;
 
+    // Run underway migrations (background task queue)
+    underway::run_migrations(&*db_pools).await?;
+
     // Setup outlet schema and pool if request logging is enabled
     let outlet_pools = if config.enable_request_logging {
         info!("Setting up outlet request logging pool (logging enabled)");
@@ -919,7 +977,10 @@ pub async fn build_router(
     analytics_sender: Option<request_logging::batcher::AnalyticsSender>,
     metrics_recorder: Option<GenAiMetrics>,
     strict_mode: bool,
+    responses_middleware_state: Option<crate::responses::middleware::ResponsesMiddlewareState>,
 ) -> anyhow::Result<Router> {
+    let config = state.current_config();
+
     // Setup request logging and/or analytics based on config flags
     //
     // These can be enabled independently:
@@ -928,8 +989,8 @@ pub async fn build_router(
     //
     // Both require the RequestLoggerLayer to capture request/response data, but use
     // different handlers to process that data.
-    let request_logging_enabled = state.outlet_db.is_some() && state.config.enable_request_logging;
-    let analytics_enabled = state.config.enable_analytics;
+    let request_logging_enabled = state.outlet_db.is_some() && config.enable_request_logging;
+    let analytics_enabled = config.enable_analytics;
 
     let outlet_layer = if request_logging_enabled || analytics_enabled {
         // Store the metrics recorder in state (created earlier in Application::new)
@@ -952,8 +1013,15 @@ pub async fn build_router(
         // Add AnalyticsHandler for analytics/billing if enabled
         // The batcher is spawned in setup_background_services and managed by BackgroundServices
         if let Some(sender) = analytics_sender {
-            let analytics_handler = request_logging::AnalyticsHandler::new(sender, uuid::Uuid::new_v4(), state.config.clone());
+            let analytics_handler = request_logging::AnalyticsHandler::new(sender, uuid::Uuid::new_v4(), config.as_ref().clone());
             multi_handler = multi_handler.with(analytics_handler);
+        }
+
+        // Add FusilladeOutletHandler to enqueue response completion jobs
+        if responses_middleware_state.is_some() {
+            let fusillade_handler =
+                crate::responses::outlet_handler::FusilladeOutletHandler::new(state.task_runner.complete_response_job.clone());
+            multi_handler = multi_handler.with(fusillade_handler);
         }
 
         // Only create layer if at least one handler is enabled (should always be true here)
@@ -964,6 +1032,7 @@ pub async fn build_router(
                 capture_request_body: true,
                 capture_response_body: true,
                 path_filter: None, // No path filter needed - applied directly to ai_router
+                ..Default::default()
             };
             Some(RequestLoggerLayer::new(outlet_config, multi_handler))
         }
@@ -992,6 +1061,9 @@ pub async fn build_router(
     // API routes
     let api_routes = Router::new()
         .route("/config", get(api::handlers::config::get_config))
+        // CLI login endpoints — under /admin/api/v1/ so they route through the app,
+        // not through oauth2-proxy (which intercepts all /authentication/* paths).
+        .route("/auth/cli-callback", get(api::handlers::auth::cli_callback))
         // User management (admin only for collection operations)
         .route("/users", get(api::handlers::users::list_users))
         .route("/users", post(api::handlers::users::create_user))
@@ -1038,6 +1110,7 @@ pub async fn build_router(
         .route("/payments/{id}", patch(api::handlers::payments::process_payment))
         .route("/billing-portal", post(api::handlers::payments::create_billing_portal_session))
         .route("/auto-topup/enable", post(api::handlers::payments::enable_auto_topup))
+        .route("/auto-topup/disable", post(api::handlers::payments::disable_auto_topup))
         // Inference endpoints management (admin only for write operations)
         .route("/endpoints", get(api::handlers::inference_endpoints::list_inference_endpoints))
         .route("/endpoints", post(api::handlers::inference_endpoints::create_inference_endpoint))
@@ -1064,6 +1137,26 @@ pub async fn build_router(
         .route("/models/{id}", get(api::handlers::deployments::get_deployed_model))
         .route("/models/{id}", patch(api::handlers::deployments::update_deployed_model))
         .route("/models/{id}", delete(api::handlers::deployments::delete_deployed_model))
+        .route(
+            "/provider-display-configs",
+            get(api::handlers::provider_display_configs::list_provider_display_configs),
+        )
+        .route(
+            "/provider-display-configs",
+            post(api::handlers::provider_display_configs::create_provider_display_config),
+        )
+        .route(
+            "/provider-display-configs/{provider_key}",
+            get(api::handlers::provider_display_configs::get_provider_display_config),
+        )
+        .route(
+            "/provider-display-configs/{provider_key}",
+            patch(api::handlers::provider_display_configs::update_provider_display_config),
+        )
+        .route(
+            "/provider-display-configs/{provider_key}",
+            delete(api::handlers::provider_display_configs::delete_provider_display_config),
+        )
         // Composite model component management (for models where is_composite=true)
         .route("/models/{id}/components", get(api::handlers::deployments::get_model_components))
         .route(
@@ -1119,6 +1212,8 @@ pub async fn build_router(
             "/organizations/{id}/members/{user_id}",
             delete(api::handlers::organizations::remove_member),
         )
+        // Leave organization (self-removal)
+        .route("/organizations/{id}/leave", post(api::handlers::organizations::leave_organization))
         // Organization invites
         .route("/organizations/{id}/invites", post(api::handlers::organizations::invite_member))
         .route(
@@ -1144,6 +1239,13 @@ pub async fn build_router(
         )
         // Organization session context (validates membership, client stores org ID for X-Organization-Id header)
         .route("/session/organization", post(api::handlers::organizations::set_active_organization))
+        // Support requests
+        .route("/support/requests", post(api::handlers::support::submit_support_request))
+        .route("/batches/requests", get(api::handlers::batch_requests::list_batch_requests))
+        .route(
+            "/batches/requests/{request_id}",
+            get(api::handlers::batch_requests::get_batch_request),
+        )
         .route("/requests", get(api::handlers::requests::list_requests))
         .route("/requests/aggregate", get(api::handlers::requests::aggregate_requests))
         .route("/requests/aggregate-by-user", get(api::handlers::requests::aggregate_by_user))
@@ -1164,15 +1266,77 @@ pub async fn build_router(
         .route(
             "/monitoring/pending-request-counts",
             get(api::handlers::queue::get_pending_request_counts),
+        )
+        // Tool sources CRUD
+        .route("/tool-sources", get(api::handlers::tool_sources::list_tool_sources))
+        .route("/tool-sources", post(api::handlers::tool_sources::create_tool_source))
+        .route("/tool-sources/{id}", get(api::handlers::tool_sources::get_tool_source))
+        .route("/tool-sources/{id}", patch(api::handlers::tool_sources::update_tool_source))
+        .route("/tool-sources/{id}", delete(api::handlers::tool_sources::delete_tool_source))
+        // Tool sources ↔ deployment attachment
+        .route(
+            "/deployments/{id}/tool-sources",
+            get(api::handlers::tool_sources::list_deployment_tool_sources),
+        )
+        .route(
+            "/deployments/{id}/tool-sources/{source_id}",
+            axum::routing::put(api::handlers::tool_sources::attach_tool_source_to_deployment),
+        )
+        .route(
+            "/deployments/{id}/tool-sources/{source_id}",
+            delete(api::handlers::tool_sources::detach_tool_source_from_deployment),
+        )
+        // Tool sources ↔ group attachment
+        .route(
+            "/groups/{id}/tool-sources",
+            get(api::handlers::tool_sources::list_group_tool_sources),
+        )
+        .route(
+            "/groups/{id}/tool-sources/{source_id}",
+            axum::routing::put(api::handlers::tool_sources::attach_tool_source_to_group),
+        )
+        .route(
+            "/groups/{id}/tool-sources/{source_id}",
+            delete(api::handlers::tool_sources::detach_tool_source_from_group),
+        )
+        // Connections (external data sources)
+        .route("/connections", post(api::handlers::connections::create_connection))
+        .route("/connections", get(api::handlers::connections::list_connections))
+        .route("/connections/{connection_id}", get(api::handlers::connections::get_connection))
+        .route(
+            "/connections/{connection_id}",
+            delete(api::handlers::connections::delete_connection),
+        )
+        .route(
+            "/connections/{connection_id}/test",
+            post(api::handlers::connections::test_connection),
+        )
+        .route(
+            "/connections/{connection_id}/files",
+            get(api::handlers::connections::list_connection_files),
+        )
+        .route(
+            "/connections/{connection_id}/synced-keys",
+            get(api::handlers::connections::list_synced_keys),
+        )
+        .route("/connections/{connection_id}/sync", post(api::handlers::connections::trigger_sync))
+        .route("/connections/{connection_id}/syncs", get(api::handlers::connections::list_syncs))
+        .route(
+            "/connections/{connection_id}/syncs/{sync_id}",
+            get(api::handlers::connections::get_sync),
+        )
+        .route(
+            "/connections/{connection_id}/syncs/{sync_id}/entries",
+            get(api::handlers::connections::list_sync_entries),
         );
 
     let api_routes_with_state = api_routes.with_state(state.clone());
 
     // Batches API routes (files + batches) - conditionally enabled under /ai/v1
-    let batches_routes = if state.config.batches.enabled {
+    let batches_routes = if config.batches.enabled {
         // File upload route with custom body limit (other routes use default)
         // 0 = unlimited (disable body limit), otherwise set max size
-        let file_upload_limit = state.config.limits.files.max_file_size;
+        let file_upload_limit = config.limits.files.max_file_size;
         let body_limit_layer = if file_upload_limit == 0 {
             DefaultBodyLimit::disable()
         } else {
@@ -1193,6 +1357,8 @@ pub async fn build_router(
                 .route("/files/{file_id}", delete(api::handlers::files::delete_file))
                 .route("/files/{file_id}/content", get(api::handlers::files::get_file_content))
                 .route("/files/{file_id}/cost-estimate", get(api::handlers::files::get_file_cost_estimate))
+                // Responses retrieval (Open Responses API)
+                .route("/responses/{response_id}", get(crate::responses::handler::get_response))
                 // Batches management
                 .route("/batches", post(api::handlers::batches::create_batch))
                 .route("/batches", get(api::handlers::batches::list_batches))
@@ -1220,6 +1386,16 @@ pub async fn build_router(
     // Serve embedded static assets, falling back to SPA for unmatched routes
     let fallback = get(api::handlers::static_assets::serve_embedded_asset).fallback(get(api::handlers::static_assets::spa_fallback));
 
+    // Apply tool injection middleware to the onwards router so that per-request tool
+    // schemas are resolved and injected into the request body before onwards processes it.
+    let tool_injection_state = crate::tool_injection::ToolInjectionState {
+        db: state.db.write().clone(),
+    };
+    let onwards_router = onwards_router.layer(middleware::from_fn_with_state(
+        tool_injection_state,
+        crate::tool_injection::tool_injection_middleware,
+    ));
+
     // Apply error enrichment middleware to onwards router (before outlet logging)
     let onwards_router = onwards_router.layer(middleware::from_fn_with_state(
         state.db.write().clone(),
@@ -1229,6 +1405,18 @@ pub async fn build_router(
     // Apply request logging layer only to onwards router
     let onwards_router = if let Some(outlet_layer) = outlet_layer.clone() {
         onwards_router.layer(outlet_layer)
+    } else {
+        onwards_router
+    };
+
+    // Apply responses middleware to create pending fusillade rows for /v1/responses requests.
+    // This runs BEFORE outlet (outer layer executes first), so the X-Onwards-Response-Id
+    // header is set before outlet captures the request and passes it to FusilladeOutletHandler.
+    let onwards_router = if let Some(rms) = responses_middleware_state {
+        onwards_router.layer(middleware::from_fn_with_state(
+            rms,
+            crate::responses::middleware::responses_middleware,
+        ))
     } else {
         onwards_router
     };
@@ -1287,20 +1475,27 @@ pub async fn build_router(
         .fallback_service(fallback.with_state(state.clone()));
 
     // Create CORS layer from config
-    let cors_layer = create_cors_layer(&state.config)?;
+    let cors_layer = create_cors_layer(&config)?;
 
     // Apply CORS to main router (request logging already applied to onwards_router above)
     let mut router = router.layer(cors_layer);
 
     // Add Prometheus metrics if enabled
-    if state.config.enable_metrics {
+    if config.enable_metrics {
         let metric_handle = get_or_install_prometheus_handle();
 
-        let prometheus_layer = PrometheusMetricLayerBuilder::new()
-            .with_prefix("dwctl")
-            .with_metrics_from_fn(move || metric_handle.clone())
-            .build_pair()
-            .0;
+        let prometheus_layer = if AXUM_PROMETHEUS_PREFIX_SET.set(()).is_ok() {
+            PrometheusMetricLayerBuilder::new()
+                .with_prefix("dwctl")
+                .with_metrics_from_fn(move || metric_handle.clone())
+                .build_pair()
+                .0
+        } else {
+            PrometheusMetricLayerBuilder::new()
+                .with_metrics_from_fn(move || metric_handle.clone())
+                .build_pair()
+                .0
+        };
 
         // Get the GenAI registry from the metrics recorder (already initialized earlier)
         let gen_ai_registry = if let Some(ref recorder) = state.metrics_recorder {
@@ -1476,6 +1671,21 @@ async fn inject_trace_id(request: axum::extract::Request, next: middleware::Next
 /// the shutdown token, signaling all tasks to stop.
 pub struct BackgroundServices {
     request_manager: Arc<fusillade::PostgresRequestManager<DbPools, fusillade::ReqwestHttpClient>>,
+    /// Step storage for multi-step responses, sharing the same fusillade
+    /// pool as the request manager. Constructed in
+    /// `setup_background_services` so the manager's processor (which
+    /// dwctl wires later in `Application::new_with_pool`) can use it.
+    step_manager: Arc<fusillade::PostgresResponseStepManager<DbPools>>,
+    /// The onwards-instance daemon id registered in the `daemons` table
+    /// for realtime / inline-loop attribution. The graceful-shutdown
+    /// drain (`shutdown()`) marks this row Dead and releases any
+    /// in-progress rows it owns back to `pending` so the next pod picks
+    /// them up immediately rather than waiting for stale-daemon
+    /// detection (~30s).
+    onwards_daemon_id: Option<Uuid>,
+    /// Fusillade write pool retained for the SIGTERM drain queries.
+    fusillade_write_pool: Option<sqlx::PgPool>,
+    task_runner: Arc<tasks::TaskRunner>,
     is_leader: bool,
     onwards_targets: onwards::target::Targets,
     #[cfg_attr(not(test), allow(dead_code))]
@@ -1491,34 +1701,59 @@ pub struct BackgroundServices {
     shutdown_token: tokio_util::sync::CancellationToken,
     // Pub so that we can disarm it if we want to
     pub drop_guard: Option<tokio_util::sync::DropGuard>,
+    /// Connections encryption key, derived once at startup.
+    connections_encryption_key: Option<Vec<u8>>,
 }
 
 impl BackgroundServices {
+    fn spawn<F>(&mut self, name: &'static str, future: F)
+    where
+        F: std::future::Future<Output = anyhow::Result<()>> + Send + 'static,
+    {
+        let abort_handle = self.background_tasks.spawn(future);
+        self.task_names.insert(abort_handle.id(), name);
+    }
+
     /// Wait for any background task to complete (indicating a failure)
     /// This method is cancel-safe - can be used in tokio::select! without losing tasks
     /// Returns an error with details about which task failed
     pub async fn wait_for_failure(&mut self) -> anyhow::Result<std::convert::Infallible> {
-        match self.background_tasks.join_next_with_id().await {
-            None => {
-                // No background tasks - wait forever
-                futures::future::pending::<()>().await;
-                unreachable!()
-            }
-            Some(Ok((task_id, Ok(())))) => {
-                let task_name = self.task_names.get(&task_id).copied().unwrap_or("unknown");
-                tracing::warn!(task = task_name, "Background task completed unexpectedly");
-                anyhow::bail!("Background task '{}' completed early", task_name)
-            }
-            Some(Ok((task_id, Err(e)))) => {
-                let task_name = self.task_names.get(&task_id).copied().unwrap_or("unknown");
-                tracing::error!(task = task_name, error = %e, "Background task failed");
-                anyhow::bail!("Background task '{}' failed: {}", task_name, e)
-            }
-            Some(Err(e)) => {
-                let task_id = e.id();
-                let task_name = self.task_names.get(&task_id).copied().unwrap_or("unknown");
-                tracing::error!(task = task_name, error = %e, "Background task panicked");
-                anyhow::bail!("Background task '{}' panicked: {}", task_name, e)
+        loop {
+            match self.background_tasks.join_next_with_id().await {
+                None => {
+                    // No background tasks - wait forever
+                    futures::future::pending::<()>().await;
+                    unreachable!()
+                }
+                Some(Ok((task_id, Ok(())))) if self.shutdown_token.is_cancelled() => {
+                    let task_name = self.task_names.get(&task_id).copied().unwrap_or("unknown");
+                    tracing::debug!(task = task_name, "Background task completed during shutdown");
+                }
+                Some(Ok((task_id, Ok(())))) => {
+                    let task_name = self.task_names.get(&task_id).copied().unwrap_or("unknown");
+                    tracing::warn!(task = task_name, "Background task completed unexpectedly");
+                    anyhow::bail!("Background task '{}' completed early", task_name)
+                }
+                Some(Ok((task_id, Err(e)))) if self.shutdown_token.is_cancelled() => {
+                    let task_name = self.task_names.get(&task_id).copied().unwrap_or("unknown");
+                    tracing::debug!(task = task_name, error = %e, "Background task exited with error during shutdown");
+                }
+                Some(Ok((task_id, Err(e)))) => {
+                    let task_name = self.task_names.get(&task_id).copied().unwrap_or("unknown");
+                    tracing::error!(task = task_name, error = %e, "Background task failed");
+                    anyhow::bail!("Background task '{}' failed: {}", task_name, e)
+                }
+                Some(Err(e)) if self.shutdown_token.is_cancelled() => {
+                    let task_id = e.id();
+                    let task_name = self.task_names.get(&task_id).copied().unwrap_or("unknown");
+                    tracing::debug!(task = task_name, error = %e, "Background task panicked during shutdown");
+                }
+                Some(Err(e)) => {
+                    let task_id = e.id();
+                    let task_name = self.task_names.get(&task_id).copied().unwrap_or("unknown");
+                    tracing::error!(task = task_name, error = %e, "Background task panicked");
+                    anyhow::bail!("Background task '{}' panicked: {}", task_name, e)
+                }
             }
         }
     }
@@ -1528,10 +1763,91 @@ impl BackgroundServices {
         self.shutdown_token.clone()
     }
 
-    /// Gracefully shutdown all background tasks
+    /// Gracefully shutdown all background tasks.
+    ///
+    /// Implements the SIGTERM drain protocol from
+    /// `fusillade/docs/plans/2026-04-28-multi-step-responses.md` (COR-353):
+    ///
+    /// 1. Signal all in-process tasks to stop accepting new work
+    ///    (`shutdown_token.cancel()`). The fusillade batch daemon stops
+    ///    claiming and waits for in-flight workers to finish their
+    ///    current loop iteration; it then marks its own daemon row Dead
+    ///    via the `Running -> Dead` typestate transition.
+    /// 2. Drain the **onwards-instance daemon** registration: this row
+    ///    is created manually for realtime/inline-loop attribution and
+    ///    is not managed by fusillade's daemon lifecycle, so we mark it
+    ///    Dead explicitly + release any rows it owns back to pending.
+    ///    Without this, the rows would wait for fusillade's stale-
+    ///    daemon detection (default ~30s) before the next pod picks
+    ///    them up.
+    ///
+    /// The drain is best-effort and logs errors rather than failing
+    /// shutdown — a slow/missing drain falls back to time-based
+    /// reclaim, which is correct just slower.
     pub async fn shutdown(mut self) {
         // Signal all background tasks to shutdown
         self.shutdown_token.cancel();
+
+        // Drain the onwards-instance daemon registration before joining
+        // tasks: this is the SIGTERM drain that gives the next pod
+        // immediate ownership of any rows we still hold. We do this
+        // BEFORE waiting for tasks because the unclaim is independent
+        // of in-flight task completion — it just touches DB state.
+        if let (Some(daemon_id), Some(pool)) = (self.onwards_daemon_id, self.fusillade_write_pool.as_ref()) {
+            // Mark our daemon row Dead. fusillade's reclaim query
+            // (`unclaim_stale_requests`) treats `daemons.status='dead'`
+            // as the immediate-reclaim signal, so as soon as this
+            // commits the next claim cycle on any other instance will
+            // see our rows.
+            //
+            // The `dead_timestamp_check` constraint on `daemons`
+            // requires `stopped_at IS NOT NULL` when status='dead', so
+            // we set it explicitly here.
+            let mark_dead = sqlx::query(
+                "UPDATE daemons SET status = 'dead', stopped_at = NOW() \
+                 WHERE id = $1",
+            )
+            .bind(daemon_id)
+            .execute(pool)
+            .await;
+            if let Err(e) = mark_dead {
+                tracing::warn!(error = %e, daemon_id = %daemon_id,
+                    "SIGTERM drain: failed to mark onwards daemon Dead — \
+                     rows will be reclaimed via stale-daemon detection");
+            } else {
+                tracing::info!(daemon_id = %daemon_id, "SIGTERM drain: marked onwards daemon Dead");
+            }
+
+            // Explicitly release any rows we own back to pending so the
+            // next pod's claim cycle picks them up immediately rather
+            // than waiting for the time-based fallback path. The
+            // typestate constraints on `requests` require we clear
+            // claimed_at/started_at when going back to pending.
+            let unclaim = sqlx::query(
+                "UPDATE requests \
+                 SET state = 'pending', daemon_id = NULL, claimed_at = NULL, started_at = NULL \
+                 WHERE daemon_id = $1 AND state IN ('claimed', 'processing')",
+            )
+            .bind(daemon_id)
+            .execute(pool)
+            .await;
+            match unclaim {
+                Ok(result) => {
+                    if result.rows_affected() > 0 {
+                        tracing::info!(
+                            daemon_id = %daemon_id,
+                            rows_released = result.rows_affected(),
+                            "SIGTERM drain: released claimed/processing rows back to pending"
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, daemon_id = %daemon_id,
+                        "SIGTERM drain: failed to unclaim rows — \
+                         rows will be reclaimed via stale-daemon detection");
+                }
+            }
+        }
 
         // Wait for all background tasks to complete and check for errors
         while let Some(result) = self.background_tasks.join_next_with_id().await {
@@ -1609,22 +1925,109 @@ impl BackgroundTaskBuilder {
 }
 
 /// Setup background services (probe scheduler, batch daemon, leader election, onwards integration)
-async fn setup_background_services(
-    pool: PgPool,
-    fusillade_pools: DbPools,
-    outlet_pool: Option<PgPool>,
-    config: Config,
-    shutdown_token: tokio_util::sync::CancellationToken,
-    metrics_recorder: Option<GenAiMetrics>,
-) -> anyhow::Result<BackgroundServices> {
-    use fusillade::manager::postgres::BatchInsertStrategy;
+/// Wire the fusillade request manager, step manager, and (optionally)
+/// the multi-step [`DwctlRequestProcessor`] into the daemon and start
+/// the background-services stack.
+///
+/// The caller owns construction of `request_manager`, `step_manager`,
+/// and `multi_step_processor` — and must build them in that order —
+/// because the multi-step processor depends on a `FusilladeResponseStore`,
+/// which itself depends on the request manager and step manager. That
+/// ordering is enforced at the type level (you cannot construct the
+/// processor without first constructing the others), which is why we
+/// take them as parameters rather than constructing them here: it
+/// guarantees that `set_processor` runs *before* any daemon spawn
+/// inside this function, including the leader-election callback's
+/// daemon spawn.
+///
+/// Pre-PR #1064 this function used to construct the request manager
+/// itself and spawn the daemon *before* the caller had a chance to
+/// build and wire the multi-step processor — which meant fusillade's
+/// `OnceLock`-snapshot in `PostgresRequestManager::run` captured a
+/// `None` processor and the daemon fell back to `DefaultRequestProcessor`
+/// for every `/v1/responses + service_tier=flex` claim, looping the
+/// request body back to ourselves and producing the
+/// `{"choices":[],"usage":null}` terminal failure observed in prod.
+///
+/// `multi_step_processor` is `Option<...>` so the test path can pass
+/// `None` to avoid forming the `request_manager → processor → response_store
+/// → request_manager` Arc cycle that blocks `sqlx::test`'s `DROP DATABASE`
+/// cleanup (the cycle's only effect in production — where the app lives
+/// forever — is benign).
+pub(crate) struct BackgroundServicesInput {
+    /// Fusillade's HTTP request manager. The caller builds this so the
+    /// multi-step processor (which depends on it transitively via
+    /// `FusilladeResponseStore`) can be constructed and injected via
+    /// `set_processor` before any daemon spawn inside this function.
+    pub request_manager: Arc<fusillade::PostgresRequestManager<DbPools, fusillade::ReqwestHttpClient>>,
+    /// Fusillade's response-step manager. Shares the same fusillade
+    /// pool as the request manager.
+    pub step_manager: Arc<fusillade::PostgresResponseStepManager<DbPools>>,
+    /// Multi-step processor to inject onto the request manager. `None`
+    /// in tests to avoid forming the `request_manager → processor →
+    /// response_store → request_manager` Arc cycle that blocks
+    /// `sqlx::test`'s `DROP DATABASE` cleanup.
+    pub multi_step_processor: Option<
+        Arc<
+            dyn fusillade::RequestProcessor<
+                    fusillade::PostgresRequestManager<DbPools, fusillade::ReqwestHttpClient>,
+                    fusillade::ReqwestHttpClient,
+                > + Send
+                + Sync,
+        >,
+    >,
+    /// Shared map between the fusillade daemon's concurrency control
+    /// and the onwards config-sync writer. Built once by the caller and
+    /// passed in by-clone here.
+    pub model_capacity_limits: Arc<dashmap::DashMap<String, usize>>,
+    /// dwctl primary pool (used for probe scheduler, notification
+    /// poller, and the responses middleware setup).
+    pub pool: PgPool,
+    /// Fusillade pool wrapper; kept around inside this function only
+    /// to clone the write pool for the metrics sampler — fusillade's
+    /// daemon already owns its own clone via `request_manager`.
+    pub fusillade_pools: DbPools,
+    /// Outlet (request-logging) pool. Optional because outlet is
+    /// optional.
+    pub outlet_pool: Option<PgPool>,
+    pub config: Config,
+    pub shared_config: SharedConfig,
+    pub shutdown_token: tokio_util::sync::CancellationToken,
+    pub metrics_recorder: Option<GenAiMetrics>,
+}
+
+async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Result<BackgroundServices> {
+    let BackgroundServicesInput {
+        request_manager,
+        step_manager,
+        multi_step_processor,
+        model_capacity_limits,
+        pool,
+        fusillade_pools,
+        outlet_pool,
+        config,
+        shared_config,
+        shutdown_token,
+        metrics_recorder,
+    } = input;
+
+    // Wire the multi-step processor onto the request manager *before*
+    // any daemon spawn below — this is the whole reason `setup_background_services`
+    // accepts these as parameters rather than constructing them itself.
+    // See the function-level doc comment.
+    if let Some(processor) = multi_step_processor
+        && let Err(e) = request_manager.set_processor(processor)
+    {
+        tracing::warn!(error = e, "Multi-step processor was already set; skipping");
+    }
+
     let drop_guard = shutdown_token.clone().drop_guard();
     // Track all background task handles for graceful shutdown
     let mut background_tasks = BackgroundTaskBuilder::new();
 
-    // Create shared model capacity limits map for daemon coordination
-    // This is populated by onwards config sync and read by fusillade daemon
-    let model_capacity_limits = Arc::new(dashmap::DashMap::new());
+    // `model_capacity_limits` (the shared map between the fusillade
+    // daemon's concurrency control and the onwards config-sync writer)
+    // is now owned by the caller — see the function-level doc.
 
     // Start onwards integration for proxying AI requests (if enabled)
     #[cfg_attr(not(test), allow(unused_variables))]
@@ -1693,23 +2096,11 @@ async fn setup_background_services(
 
     let probe_scheduler = probes::ProbeScheduler::new(pool.clone(), config.clone());
 
-    // Clone fusillade pools for metrics before moving into request manager
+    // Caller owns `request_manager` / `step_manager` construction —
+    // see the function-level doc. We still need a pool clone here for
+    // the metrics sampler; `fusillade_pools` is otherwise unused.
     let fusillade_pool_for_metrics = fusillade_pools.write().clone();
-
-    // Initialize the fusillade request manager (for batch processing)
-    let request_manager = Arc::new(
-        fusillade::PostgresRequestManager::new(fusillade_pools)
-            .with_config(
-                config
-                    .background_services
-                    .batch_daemon
-                    .to_fusillade_config_with_limits(Some(model_capacity_limits.clone())),
-            )
-            .with_download_buffer_size(config.batches.files.download_buffer_size)
-            .with_batch_insert_strategy(BatchInsertStrategy::Batched {
-                batch_size: config.batches.files.batch_insert_size,
-            }),
-    );
+    drop(fusillade_pools);
 
     let is_leader: bool;
 
@@ -1958,6 +2349,26 @@ async fn setup_background_services(
         });
     }
 
+    // Create a dedicated pool for the underway worker so its long-lived
+    // PgListener connections don't compete with the main pool.
+    let uw = config.database.underway_pool_settings();
+    let underway_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(uw.max_connections)
+        .min_connections(uw.min_connections)
+        .acquire_timeout(std::time::Duration::from_secs(uw.acquire_timeout_secs))
+        .idle_timeout(if uw.idle_timeout_secs > 0 {
+            Some(std::time::Duration::from_secs(uw.idle_timeout_secs))
+        } else {
+            None
+        })
+        .max_lifetime(if uw.max_lifetime_secs > 0 {
+            Some(std::time::Duration::from_secs(uw.max_lifetime_secs))
+        } else {
+            None
+        })
+        .connect_with(pool.connect_options().as_ref().clone())
+        .await?;
+
     // Start pool metrics sampler if metrics are enabled
     if config.enable_metrics {
         let mut pools = vec![
@@ -1968,6 +2379,10 @@ async fn setup_background_services(
             db::LabeledPool {
                 name: "fusillade",
                 pool: fusillade_pool_for_metrics,
+            },
+            db::LabeledPool {
+                name: "main_underway",
+                pool: underway_pool.clone(),
             },
         ];
         if let Some(outlet) = outlet_pool {
@@ -2000,10 +2415,43 @@ async fn setup_background_services(
         None
     };
 
+    // Build the underway task runner for background jobs (batch population, sync pipeline, etc.)
+    let encryption_key = match config.connections.encryption_key.as_deref().or(config.secret_key.as_deref()) {
+        Some(secret) if !secret.trim().is_empty() => Some(encryption::derive_encryption_key(secret.trim())),
+        Some(_) => {
+            tracing::warn!("Encryption key is empty/whitespace — connection features will be unavailable");
+            None
+        }
+        None => {
+            tracing::info!("No encryption key configured for connections (set secret_key or connections.encryption_key)");
+            None
+        }
+    };
+    let task_state = tasks::TaskState {
+        request_manager: request_manager.clone(),
+        dwctl_pool: pool.clone(),
+        config: shared_config.clone(),
+        encryption_key: encryption_key.clone(),
+        ingest_file_job: Arc::new(std::sync::OnceLock::new()),
+        activate_batch_job: Arc::new(std::sync::OnceLock::new()),
+        create_batch_job: Arc::new(std::sync::OnceLock::new()),
+        cascade_batch_state_job: Arc::new(std::sync::OnceLock::new()),
+    };
+    let task_runner = Arc::new(tasks::TaskRunner::new(underway_pool, task_state, &config.background_services.task_workers).await?);
+    for (name, handle) in task_runner.start(
+        shutdown_token.clone(),
+        &config.background_services.task_workers,
+        &config.background_services.sync_workers,
+    ) {
+        background_tasks.spawn(name, async move { handle.await.map_err(|e| anyhow::anyhow!("{}", e)) });
+    }
+
     let (background_tasks, task_names) = background_tasks.into_parts();
 
     Ok(BackgroundServices {
         request_manager,
+        step_manager,
+        task_runner,
         is_leader,
         onwards_targets: initial_targets,
         onwards_sender,
@@ -2013,6 +2461,12 @@ async fn setup_background_services(
         task_names,
         shutdown_token,
         drop_guard: Some(drop_guard),
+        connections_encryption_key: encryption_key.clone(),
+        // Application::new_with_pool wires these once the onwards-
+        // instance daemon row is registered. Kept Optional here so
+        // tests that bypass that wiring still construct cleanly.
+        onwards_daemon_id: None,
+        fusillade_write_pool: None,
     })
 }
 
@@ -2049,7 +2503,15 @@ impl Application {
     /// If `pool` is provided, it will be used directly instead of creating a new connection.
     /// This is useful for tests where sqlx::test provides a pool.
     pub async fn new(config: Config, tracer_provider: Option<telemetry::SdkTracerProvider>) -> anyhow::Result<Self> {
-        Self::new_with_pool(config, None, tracer_provider).await
+        Self::new_with_pool_and_config_path(config, None, None, tracer_provider).await
+    }
+
+    pub async fn new_with_config_path(
+        config: Config,
+        config_path: Option<PathBuf>,
+        tracer_provider: Option<telemetry::SdkTracerProvider>,
+    ) -> anyhow::Result<Self> {
+        Self::new_with_pool_and_config_path(config, config_path, None, tracer_provider).await
     }
 
     /// Create a new application instance with an existing database pool
@@ -2058,6 +2520,15 @@ impl Application {
     /// For production use, prefer [`Application::new`] which will create its own pool.
     pub async fn new_with_pool(
         config: Config,
+        pool: Option<PgPool>,
+        tracer_provider: Option<telemetry::SdkTracerProvider>,
+    ) -> anyhow::Result<Self> {
+        Self::new_with_pool_and_config_path(config, None, pool, tracer_provider).await
+    }
+
+    pub async fn new_with_pool_and_config_path(
+        config: Config,
+        config_path: Option<PathBuf>,
         pool: Option<PgPool>,
         tracer_provider: Option<telemetry::SdkTracerProvider>,
     ) -> anyhow::Result<Self> {
@@ -2087,14 +2558,113 @@ impl Application {
         // Setup background services (onwards integration, probe scheduler, batch daemon, leader election)
         // Note: Must use primary pool (via Deref) because onwards sync uses LISTEN/NOTIFY
         // which requires direct database connection to primary (not through PgBouncer transaction pooling)
-        let bg_services = setup_background_services(
-            (*db_pools).clone(),
-            fusillade_pools.clone(),
-            outlet_pools.as_ref().map(|p| (**p).clone()),
-            config.clone(),
-            shutdown_token.clone(),
-            metrics_recorder.clone(),
-        )
+        let shared_config = SharedConfig::new(config.clone());
+
+        // Build the fusillade request manager, step manager, response
+        // store, and multi-step processor *before* spawning any daemons.
+        // Order is enforced at the type level (processor depends on
+        // response_store depends on (request_manager, step_manager)),
+        // so by the time we hand all four to `setup_background_services`,
+        // it can safely call `request_manager.set_processor(...)` before
+        // any daemon spawn. Fusillade's daemon snapshots the processor
+        // via `OnceLock::get()` at `run()` time, so anything spawned
+        // afterward (synchronous fusillade daemon AND the leader-gained
+        // closure) sees the multi-step processor — that's what fixes
+        // the `/v1/responses + service_tier=flex` regression where the
+        // daemon kept using `DefaultRequestProcessor` and looped the
+        // request body back to ourselves.
+        //
+        // Shared `model_capacity_limits` map: the fusillade daemon's
+        // per-model concurrency controller reads it; the onwards
+        // config-sync writer (inside `setup_background_services`)
+        // writes to it. Both must hold clones of the *same* Arc, so
+        // we build it once here.
+        let model_capacity_limits: Arc<dashmap::DashMap<String, usize>> = Arc::new(dashmap::DashMap::new());
+
+        let request_manager = Arc::new(
+            fusillade::PostgresRequestManager::new(
+                fusillade_pools.clone(),
+                config
+                    .background_services
+                    .batch_daemon
+                    .to_fusillade_config_with_limits(Some(model_capacity_limits.clone())),
+            )
+            .with_download_buffer_size(config.batches.files.download_buffer_size)
+            .with_batch_insert_strategy(fusillade::manager::postgres::BatchInsertStrategy::Batched {
+                batch_size: config.batches.files.batch_insert_size,
+            }),
+        );
+        let step_manager = Arc::new(fusillade::PostgresResponseStepManager::new(fusillade_pools.clone()));
+        let response_store =
+            Arc::new(crate::responses::store::FusilladeResponseStore::new(request_manager.clone()).with_step_manager(step_manager.clone()));
+
+        // Build the multi-step processor's dependencies. These also end
+        // up wired into the responses middleware state below; cloning
+        // them is cheap (Arc + reqwest::Client share their internal
+        // connection pool / TLS root-cert cache across clones).
+        let multi_step_reqwest_client = reqwest::Client::new();
+        let multi_step_tool_executor_pool = Arc::new(db_pools.write().clone());
+        let multi_step_tool_executor = Arc::new(crate::tool_executor::HttpToolExecutor::new(
+            multi_step_reqwest_client.clone(),
+            Some(multi_step_tool_executor_pool.clone()),
+        ));
+        let multi_step_http_client: Arc<dyn onwards::client::HttpClient + Send + Sync> =
+            Arc::new(onwards::client::create_hyper_client(10, 30));
+        let multi_step_loop_config = onwards::LoopConfig {
+            max_response_step_depth: config.responses.max_response_step_depth,
+            max_response_iterations: config.responses.max_response_iterations,
+        };
+
+        // Build the processor itself only outside test mode: the
+        // `request_manager → processor.OnceLock → response_store →
+        // request_manager` Arc cycle is harmless in production (the app
+        // lives forever) but in `#[sqlx::test]` it keeps each test's
+        // pool clones alive past test teardown, blocking sqlx's
+        // `DROP DATABASE` cleanup. Tests run with `DefaultRequestProcessor`
+        // — their multi-step coverage lives in dedicated
+        // `test/multi_step_*` modules that bypass the daemon path
+        // anyway.
+        let multi_step_processor_for_setup = if cfg!(test) {
+            None
+        } else {
+            let tool_resolver: Arc<dyn crate::responses::processor::DaemonToolResolver> =
+                Arc::new(crate::responses::processor::DbToolResolver {
+                    pool: (*db_pools).write().clone(),
+                });
+            let processor = Arc::new(
+                crate::responses::processor::DwctlRequestProcessor::new(
+                    response_store.clone(),
+                    multi_step_tool_executor.clone(),
+                    multi_step_http_client.clone(),
+                    multi_step_loop_config,
+                )
+                .with_tool_resolver(tool_resolver),
+            );
+            Some(
+                processor
+                    as Arc<
+                        dyn fusillade::RequestProcessor<
+                                fusillade::PostgresRequestManager<DbPools, fusillade::ReqwestHttpClient>,
+                                fusillade::ReqwestHttpClient,
+                            > + Send
+                            + Sync,
+                    >,
+            )
+        };
+
+        let mut bg_services = setup_background_services(BackgroundServicesInput {
+            request_manager: request_manager.clone(),
+            step_manager: step_manager.clone(),
+            multi_step_processor: multi_step_processor_for_setup,
+            model_capacity_limits,
+            pool: (*db_pools).clone(),
+            fusillade_pools: fusillade_pools.clone(),
+            outlet_pool: outlet_pools.as_ref().map(|p| (**p).clone()),
+            config: config.clone(),
+            shared_config: shared_config.clone(),
+            shutdown_token: shutdown_token.clone(),
+            metrics_recorder: metrics_recorder.clone(),
+        })
         .await?;
 
         // Enforce `stream_options.include_usage` for streaming chat completions.
@@ -2111,9 +2681,126 @@ impl Application {
         // Embeddings don't support streaming.
         let body_transform: onwards::BodyTransformFn = Arc::new(request_logging::stream_usage::stream_usage_transform);
 
-        // Build onwards router from targets with body transform and response sanitization
+        // Create the HTTP tool executor used by the single-step
+        // (non-multi-step) realtime tool-injection path. Re-uses the
+        // same reqwest::Client and dwctl pool clones the multi-step
+        // executor (built earlier, before `setup_background_services`)
+        // does — cloning a reqwest::Client shares its connection pool /
+        // TLS root cert cache, and the PgPool clone shares the
+        // underlying connection pool. Building separate
+        // clients/pools would double TLS init cost per test and add
+        // unnecessary parallelism pressure.
+        let tool_executor =
+            crate::tool_executor::HttpToolExecutor::new(multi_step_reqwest_client.clone(), Some(multi_step_tool_executor_pool.clone()));
+
+        // Register onwards as a fusillade daemon so realtime requests get a valid daemon_id.
+        let onwards_daemon_id = uuid::Uuid::new_v4();
+        let fusillade_write_pool = bg_services.request_manager.pool().clone();
+        let daemon_insert_result = sqlx::query(
+            "INSERT INTO daemons (id, hostname, pid, version, config_snapshot, status, started_at, last_heartbeat)
+             VALUES ($1, $2, $3, $4, $5, 'running', NOW(), NOW())",
+        )
+        .bind(onwards_daemon_id)
+        .bind(fusillade::daemon::types::get_hostname())
+        .bind(fusillade::daemon::types::get_pid())
+        .bind(fusillade::daemon::types::get_version())
+        .bind(serde_json::json!({"type": "onwards"}))
+        .execute(&fusillade_write_pool)
+        .await;
+
+        let daemon_registered = match &daemon_insert_result {
+            Ok(_) => {
+                tracing::info!(daemon_id = %onwards_daemon_id, "Registered onwards as fusillade daemon");
+                // Stash on bg_services so the SIGTERM drain in
+                // BackgroundServices::shutdown can mark this row Dead
+                // and release its claimed rows.
+                bg_services.onwards_daemon_id = Some(onwards_daemon_id);
+                bg_services.fusillade_write_pool = Some(fusillade_write_pool.clone());
+                true
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to register onwards daemon (table may not exist yet)");
+                false
+            }
+        };
+
+        // Spawn a background task to send periodic heartbeats for the onwards daemon.
+        // Without this, fusillade's stale daemon detection would unclaim our processing
+        // rows after stale_daemon_threshold_ms (default 30s).
+        // Only spawn if the daemon was successfully registered.
+        if daemon_registered {
+            let heartbeat_pool = fusillade_write_pool.clone();
+            let heartbeat_daemon_id = onwards_daemon_id;
+            let heartbeat_shutdown = bg_services.shutdown_token();
+            bg_services.spawn("onwards-daemon-heartbeat", async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+                loop {
+                    tokio::select! {
+                        _ = interval.tick() => {
+                            let result = sqlx::query(
+                                "UPDATE daemons SET last_heartbeat = NOW() WHERE id = $1",
+                            )
+                            .bind(heartbeat_daemon_id)
+                            .execute(&heartbeat_pool)
+                            .await;
+
+                            if let Err(e) = result {
+                                tracing::warn!(error = %e, "Failed to send onwards daemon heartbeat");
+                            }
+                        }
+                        _ = heartbeat_shutdown.cancelled() => {
+                            // Mark daemon as dead on shutdown
+                            let _ = sqlx::query(
+                                "UPDATE daemons SET status = 'dead', stopped_at = NOW() WHERE id = $1",
+                            )
+                            .bind(heartbeat_daemon_id)
+                            .execute(&heartbeat_pool)
+                            .await;
+                            tracing::info!(daemon_id = %heartbeat_daemon_id, "Onwards daemon marked as dead");
+                            break;
+                        }
+                    }
+                }
+                Ok(())
+            });
+        } // daemon_registered
+
+        // `response_store`, `multi_step_tool_executor`,
+        // `multi_step_http_client`, `multi_step_loop_config` and the
+        // multi-step processor were built upfront before
+        // `setup_background_services` — `set_processor` ran inside
+        // setup, before any daemon spawn (synchronous fusillade daemon
+        // OR the leader-gained closure). All daemons see the
+        // multi-step processor at claim time.
+
+        // Responses middleware state (enqueues create-response jobs via underway)
+        let responses_middleware_state = crate::responses::middleware::ResponsesMiddlewareState {
+            request_manager: bg_services.request_manager.clone(),
+            daemon_id: crate::responses::store::OnwardsDaemonId(onwards_daemon_id),
+            loopback_base_url: {
+                let addr = config.bind_address();
+                let addr = if addr.starts_with("0.0.0.0:") {
+                    addr.replacen("0.0.0.0", "127.0.0.1", 1)
+                } else {
+                    addr
+                };
+                format!("http://{addr}/ai")
+            },
+            dwctl_pool: (*db_pools).write().clone(),
+            create_response_job: bg_services.task_runner.create_response_job.clone(),
+            response_store: response_store.clone(),
+            multi_step_tool_executor,
+            multi_step_http_client,
+            loop_config: multi_step_loop_config,
+        };
+
+        // Build onwards router from targets with body transform, response sanitization, and tool executor.
         let onwards_app_state = onwards::AppState::with_transform(bg_services.onwards_targets.clone(), body_transform)
-            .with_response_transform(onwards::create_openai_sanitizer());
+            .with_response_transform(onwards::create_openai_sanitizer())
+            .with_streaming_header("x-fusillade-stream")
+            .with_response_id_header("x-fusillade-request-id")
+            .with_tool_executor(Arc::new(tool_executor))
+            .with_response_store(response_store.clone() as Arc<dyn onwards::ResponseStore>);
         let onwards_router = if bg_services.onwards_targets.strict_mode {
             tracing::info!("Strict mode enabled - using typed request validation");
             onwards::strict::build_strict_router(onwards_app_state)
@@ -2127,12 +2814,23 @@ impl Application {
         // Build app state and router
         let mut app_state = AppState::builder()
             .db(db_pools.clone())
-            .config(config.clone())
+            .config(shared_config.clone())
             .is_leader(bg_services.is_leader)
             .request_manager(bg_services.request_manager.clone())
+            .task_runner(bg_services.task_runner.clone())
             .maybe_outlet_db(outlet_pools.clone())
             .limiters(limiters)
+            .maybe_connections_encryption_key(bg_services.connections_encryption_key.clone())
+            .response_store(response_store)
+            .response_step_manager(bg_services.step_manager.clone())
             .build();
+
+        if let Some(config_path) = config_path {
+            bg_services.spawn(
+                "config-watcher",
+                config_watcher::watch_config_file(config_path, shared_config, bg_services.shutdown_token()),
+            );
+        }
 
         let router = build_router(
             &mut app_state,
@@ -2140,6 +2838,7 @@ impl Application {
             bg_services.analytics_sender.clone(),
             metrics_recorder,
             bg_services.onwards_targets.strict_mode,
+            Some(responses_middleware_state),
         )
         .await?;
 

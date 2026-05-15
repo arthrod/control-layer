@@ -4,17 +4,22 @@
 //! and response serialization. These models define the public API contract.
 pub mod api_keys;
 pub mod auth;
+pub mod batch_requests;
 pub mod batches;
+pub mod connections;
 pub mod daemons;
 pub mod deployments;
+pub mod dwext;
 pub mod files;
 pub mod groups;
 pub mod inference_endpoints;
 pub mod organizations;
 pub mod pagination;
 pub mod probes;
+pub mod provider_display_configs;
 pub mod requests;
 pub mod tariffs;
+pub mod tool_sources;
 pub mod transactions;
 pub mod users;
 pub mod webhooks;

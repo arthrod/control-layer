@@ -52,6 +52,7 @@ import {
   formatLatency,
   formatRelativeTime,
   formatTariffPrice,
+  getVisibleTariffsForModel,
 } from "../../../../utils/formatters";
 import { Skeleton } from "../../../ui/skeleton";
 import {
@@ -62,13 +63,14 @@ import {
 import { StatusRow } from "./StatusRow";
 import { Markdown } from "../../../ui/markdown";
 import { isBatchDenied, isPlaygroundDenied, isRealtimeDenied } from "../../../../utils/modelAccess";
+import { copyToClipboard } from "../../../../utils/clipboard";
 
 const COMPLETION_WINDOWS: Record<
   string,
   { label: string; icon: typeof Clock; sort: number }
 > = {
-  "1h": { label: "High", icon: Zap, sort: 0 },
-  "24h": { label: "Standard", icon: Clock, sort: 1 },
+  "1h": { label: "Async", icon: Zap, sort: 0 },
+  "24h": { label: "Batch", icon: Clock, sort: 1 },
 };
 
 const formatReleaseDate = (dateStr: string): string => {
@@ -86,12 +88,12 @@ const CopyableModelName: React.FC<{
     if (el) setTruncated(el.scrollWidth > el.clientWidth);
   }, []);
 
-  const handleCopy = (e: React.MouseEvent) => {
+  const handleCopy = async (e: React.MouseEvent) => {
     e.stopPropagation();
-    navigator.clipboard.writeText(alias).then(() => {
+    if (await copyToClipboard(alias)) {
       setCopied(true);
       setTimeout(() => setCopied(false), 1500);
-    });
+    }
   };
 
   const title = (
@@ -201,6 +203,8 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
     endpoint: endpointId,
     group: groupId,
     is_composite: isCompositeFilter,
+    sort: "released_at",
+    sort_direction: "desc",
   });
 
   // Load metrics lazily in the background so model cards render immediately
@@ -212,6 +216,8 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
     endpoint: endpointId,
     group: groupId,
     is_composite: isCompositeFilter,
+    sort: "released_at",
+    sort_direction: "desc",
     enabled: canViewAnalytics,
   });
 
@@ -689,8 +695,21 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
                               {(() => {
                                 const realtimeDenied = isRealtimeDenied(model);
                                 const batchDenied = isBatchDenied(model);
-                                const realtimeTariff = model.tariffs?.find(
-                                  (t) => t.api_key_purpose === "realtime" || t.api_key_purpose === null,
+                                // Use the same filter as the catalog: drop
+                                // playground, inactive, and any tariff whose
+                                // api_key_purpose is denied by a traffic
+                                // rule on the model. Keeps the two views
+                                // consistent and prevents advertising prices
+                                // for purposes the user can't actually reach.
+                                const visibleTariffs =
+                                  getVisibleTariffsForModel(model);
+                                // The "realtime" slot consumes any tariff
+                                // whose purpose is "realtime" OR null/
+                                // undefined (the implicit fallback purpose).
+                                const realtimeTariff = visibleTariffs.find(
+                                  (t) =>
+                                    t.api_key_purpose === "realtime" ||
+                                    t.api_key_purpose == null,
                                 );
 
                                 // Determine which batch windows this model supports:
@@ -704,7 +723,7 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
 
                                 // Build batch tariff lookup for pricing
                                 const batchTariffsByWindow = new Map(
-                                  (model.tariffs ?? [])
+                                  visibleTariffs
                                     .filter((t) => t.api_key_purpose === "batch" && t.completion_window)
                                     .map((t) => [t.completion_window!, t]),
                                 );
@@ -960,6 +979,7 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
           setApiExamplesModel(null);
         }}
         model={apiExamplesModel}
+        defaultTab="realtime"
       />
 
     </>
